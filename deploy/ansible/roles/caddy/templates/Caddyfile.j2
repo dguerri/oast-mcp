@@ -1,0 +1,50 @@
+{
+  email {{ acme_email }}
+}
+
+{{ mcp_hostname }} {
+  tls {
+    dns googleclouddns {
+      gcp_project {{ gcp_project_id }}
+    }
+  }
+  reverse_proxy 127.0.0.1:{{ mcp_port }}
+}
+
+{{ agent_hostname }} {
+  tls {
+    dns googleclouddns {
+      gcp_project {{ gcp_project_id }}
+    }
+  }
+  reverse_proxy 127.0.0.1:{{ agent_port }} {
+    header_up Connection {header.Connection}
+    header_up Upgrade {header.Upgrade}
+  }
+}
+
+# OAST callbacks — HTTP served directly (no redirect) so HTTP callbacks work
+http://{{ oast_domain }}, http://*.{{ oast_domain }} {
+  reverse_proxy 127.0.0.1:{{ callback_port }}
+}
+
+# OAST callbacks — HTTPS via Caddy TLS termination (wildcard via RFC 2136 to local DNS)
+{{ oast_domain }}, *.{{ oast_domain }} {
+  tls {
+    # Use production CA only — staging issuer races its cleanup against production's
+    # TXT write, deleting the record before the propagation check can verify it.
+    ca https://acme-v02.api.letsencrypt.org/directory
+    dns rfc2136 {
+      key_name {env.RFC2136_TSIG_KEY_NAME}
+      key      {env.RFC2136_TSIG_SECRET}
+      key_alg  hmac-sha256
+      server   {{ ansible_facts['default_ipv4']['address'] }}:53
+    }
+    # Query our authoritative DNS server directly for the propagation check.
+    # Avoids a GCP recursive resolver serving a cached negative response (TTL 60s)
+    # from a previous failed attempt, which could cause the check to fail even
+    # after the TXT record has been successfully written.
+    resolvers {{ ansible_facts['default_ipv4']['address'] }}:53
+  }
+  reverse_proxy 127.0.0.1:{{ callback_port }}
+}

@@ -1,0 +1,26 @@
+[Unit]
+Description=Caddy reverse proxy with DNS-01 TLS
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+User=caddy
+Group=caddy
+ExecStart=/usr/local/bin/caddy run --config /etc/caddy/Caddyfile --adapter caddyfile
+ExecReload=/usr/local/bin/caddy reload --config /etc/caddy/Caddyfile --adapter caddyfile
+TimeoutStopSec=5s
+Restart=on-failure
+
+Environment=GOOGLE_APPLICATION_CREDENTIALS=/etc/caddy/gcp-sa.json
+EnvironmentFile=/etc/caddy/caddy-secrets.env
+
+PrivateTmp=true
+NoNewPrivileges=true
+ProtectSystem=strict
+ReadWritePaths=/var/lib/caddy /etc/caddy
+
+AmbientCapabilities=CAP_NET_BIND_SERVICE
+CapabilityBoundingSet=CAP_NET_BIND_SERVICE
+
+[Install]
+WantedBy=multi-user.target

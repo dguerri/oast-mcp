@@ -1,0 +1,75 @@
+# Build artifacts
+/oast-mcp
+bin/
+/loader.exe
+
+# Go test coverage
+coverage.out
+coverage.html
+
+# SQLite databases
+*.db
+*.db-shm
+*.db-wal
+
+# Terraform/Ansible
+!*.tfvars.example
+.ansible/
+.terraform/
+*.tfplan
+*.tfstate
+*.tfstate.*
+*.tfstate.backup
+*.tfvars
+crash.log
+deploy/terraform/.terraform.lock.hcl
+override.tf
+override.tf.json
+
+# Deploy secrets and generated files
+deploy/.env
+deploy/operator.key
+deploy/ansible/inventory/hosts.yml
+deploy/terraform/terraform.tfvars
+
+# Secrets and keys
+*.pem
+
+# Environment files
+.env
+.env.*
+!.env.example
+
+# Logs
+*.log
+
+# macOS
+.DS_Store
+
+# IDE directories
+.vscode/
+
+# LLM Agent / AI IDE directories
+.claude/
+.cursor/
+.aider*
+.copilot/
+.codeium/
+.continue/
+.windsurf/
+.bolt/
+.v0/
+.tabnine/
+.sourcegraph/
+.cody/
+.idx/
+.replit/
+.codex/
+.gemini/
+.junie/
+.roo/
+.amazonq/
+.augment*/
+
+# Project planning
+docs/plans/

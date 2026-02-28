@@ -1,0 +1,81 @@
+---
+- name: Create oast-mcp system user
+  user:
+    name: oast-mcp
+    system: true
+    shell: /usr/sbin/nologin
+    home: /var/lib/oast-mcp
+    create_home: true
+
+- name: Set data directory permissions
+  file:
+    path: /var/lib/oast-mcp
+    state: directory
+    owner: oast-mcp
+    group: oast-mcp
+    mode: "0700"
+
+- name: Create /etc/oast-mcp directory
+  file:
+    path: /etc/oast-mcp
+    state: directory
+    owner: oast-mcp
+    group: oast-mcp
+    mode: "0750"
+
+- name: Copy oast-mcp binary
+  copy:
+    src: "{{ playbook_dir }}/../../bin/oast-mcp-linux-amd64"
+    dest: /usr/local/bin/oast-mcp
+    owner: root
+    group: root
+    mode: "0755"
+  notify: restart oast-mcp
+
+- name: Create bin_dir for loader/agent binaries
+  file:
+    path: /var/lib/oast-mcp/bin
+    state: directory
+    owner: oast-mcp
+    group: oast-mcp
+    mode: "0750"
+
+- name: Copy loader and agent binaries
+  copy:
+    src: "{{ playbook_dir }}/../../bin/{{ item }}"
+    dest: /var/lib/oast-mcp/bin/{{ item }}
+    owner: oast-mcp
+    group: oast-mcp
+    mode: "0750"
+  loop:
+    - loader-linux-amd64
+    - loader-linux-arm64
+    - loader-windows-amd64.exe
+    - agent-linux-amd64
+    - agent-linux-arm64
+    - agent-windows-amd64.exe
+  notify: restart oast-mcp
+
+- name: Render config.yml
+  template:
+    src: config.yml.j2
+    dest: /etc/oast-mcp/config.yml
+    owner: oast-mcp
+    group: oast-mcp
+    mode: "0600"
+  notify: restart oast-mcp
+
+- name: Deploy systemd unit
+  template:
+    src: oast-mcp.service.j2
+    dest: /etc/systemd/system/oast-mcp.service
+    mode: "0644"
+  notify:
+    - reload systemd
+    - restart oast-mcp
+
+- name: Enable and start oast-mcp
+  service:
+    name: oast-mcp
+    state: started
+    enabled: true

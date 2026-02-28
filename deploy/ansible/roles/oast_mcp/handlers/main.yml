@@ -1,0 +1,9 @@
+---
+- name: reload systemd
+  systemd:
+    daemon_reload: true
+
+- name: restart oast-mcp
+  service:
+    name: oast-mcp
+    state: restarted

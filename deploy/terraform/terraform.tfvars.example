@@ -1,0 +1,22 @@
+# Reference only — when using `make deploy`, terraform.tfvars is generated
+# automatically from deploy/.env. You do not need to create this file manually.
+# Use this only if running Terraform directly without the Makefile.
+
+gcp_project_id       = "my-gcp-project-id"
+gcp_region           = "us-central1"
+gcp_zone             = "us-central1-a"
+vm_machine_type      = "e2-micro"
+vm_disk_size_gb      = 20
+vm_image             = "debian-cloud/debian-12"
+ssh_public_key_path  = "~/.ssh/id_ed25519.pub"  # set SSH_KEY=~/.ssh/id_ed25519 in deploy/.env; .pub is derived automatically
+admin_ssh_cidr       = "203.0.113.1/32"       # curl ifconfig.me
+
+# VM (interactsh) is authoritative NS for this zone
+oast_domain          = "oast.example.com"
+# Cloud DNS managed zone name for the parent domain
+parent_dns_zone_name = "example-com-zone"
+
+# mcp/agent hostnames must be siblings of oast_domain, NOT children.
+# See docs/domain-setup.md for why.
+mcp_hostname         = "mcp.example.com"
+agent_hostname       = "agent.example.com"

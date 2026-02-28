@@ -1,0 +1,17 @@
+domain:
+  oast_zone: "oast.example.com"
+  mcp_hostname: "mcp.oast.example.com"
+  agent_hostname: "agent.oast.example.com"
+server:
+  mcp_port: 8080
+  agent_port: 8081
+  bind_addr: "127.0.0.1"
+responder:
+  public_ip: "1.2.3.4"
+  dns_port: 5353
+  http_port: 9090
+database:
+  path: "/tmp/test.db"
+retention:
+  session_ttl_days: 7
+  event_ttl_days: 14

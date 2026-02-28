@@ -1,0 +1,35 @@
+domain:
+  oast_zone: "{{ oast_domain }}"
+  mcp_hostname: "{{ mcp_hostname }}"
+  agent_hostname: "{{ agent_hostname }}"
+
+server:
+  mcp_port: {{ mcp_port }}
+  agent_port: {{ agent_port }}
+  bind_addr: "127.0.0.1"
+
+responder:
+  public_ip: "{{ public_ip }}"
+  dns_bind_addr: "{{ ansible_facts['default_ipv4']['address'] }}"
+  http_bind_addr: "127.0.0.1"
+  dns_port: 53
+  http_port: {{ callback_port }}
+
+auth:
+  jwt_signing_key_hex: "{{ jwt_signing_key_hex }}"
+  tsig_key_name: "{{ tsig_key_name }}"
+  tsig_key_hex: "{{ tsig_key_hex }}"
+  tsig_allowed_addr: "{{ ansible_facts['default_ipv4']['address'] }}"
+
+database:
+  path: "{{ db_path }}"
+
+retention:
+  session_ttl_days: {{ retention_session_days }}
+  event_ttl_days: {{ retention_event_days }}
+
+agent:
+  operator_public_key: "{{ operator_public_key }}"
+  exec_lab_mode: {{ exec_lab_mode | lower }}
+  exec_allowlist: {{ exec_allowlist | to_json }}
+  sandbox_base_path: "{{ sandbox_base_path }}"

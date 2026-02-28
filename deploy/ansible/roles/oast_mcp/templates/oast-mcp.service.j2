@@ -1,0 +1,26 @@
+[Unit]
+Description=oast-mcp MCP server + agent channel
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+User=oast-mcp
+Group=oast-mcp
+ExecStart=/usr/local/bin/oast-mcp serve --config /etc/oast-mcp/config.yml
+Restart=on-failure
+RestartSec=5s
+
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=oast-mcp
+
+PrivateTmp=true
+NoNewPrivileges=true
+ProtectSystem=strict
+ReadWritePaths=/var/lib/oast-mcp
+
+AmbientCapabilities=CAP_NET_BIND_SERVICE
+CapabilityBoundingSet=CAP_NET_BIND_SERVICE
+
+[Install]
+WantedBy=multi-user.target

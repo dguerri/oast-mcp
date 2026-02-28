@@ -1,0 +1,26 @@
+# Defaults only — no user-specific values here.
+# All environment-specific config (domain, project, email, hostnames) comes from
+# deploy/.env and is injected by the Makefile as Ansible extra-vars.
+
+# --- Ports ---
+mcp_port: 8080
+agent_port: 8081
+callback_port: 9090
+
+# --- Database ---
+db_path: "/var/lib/oast-mcp/oast.db"
+retention_session_days: 7
+retention_event_days: 14
+
+# --- Agent ---
+exec_lab_mode: false
+exec_allowlist: []
+sandbox_base_path: "/tmp/oast-sandbox"
+
+# --- Secrets (always injected via extra-vars, never committed) ---
+jwt_signing_key_hex: ""
+operator_public_key: ""
+caddy_gcp_sa_key: ""
+tsig_key_name: ""
+tsig_key_hex: ""
+tsig_key_b64: ""

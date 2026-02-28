@@ -1,0 +1,37 @@
+---
+- name: Disable password SSH authentication
+  lineinfile:
+    path: /etc/ssh/sshd_config
+    regexp: '^#?PasswordAuthentication'
+    line: 'PasswordAuthentication no'
+    state: present
+  notify: restart sshd
+
+- name: Install fail2ban and unattended-upgrades
+  apt:
+    name:
+      - fail2ban
+      - unattended-upgrades
+    state: present
+    update_cache: true
+
+- name: Enable fail2ban service
+  service:
+    name: fail2ban
+    state: started
+    enabled: true
+
+- name: Enable unattended-upgrades
+  copy:
+    dest: /etc/apt/apt.conf.d/20auto-upgrades
+    content: |
+      APT::Periodic::Update-Package-Lists "1";
+      APT::Periodic::Unattended-Upgrade "1";
+    mode: "0644"
+
+- name: Set systemd DefaultLimitNOFILE
+  lineinfile:
+    path: /etc/systemd/system.conf
+    regexp: '^#?DefaultLimitNOFILE='
+    line: 'DefaultLimitNOFILE=65536'
+  notify: reload systemd
