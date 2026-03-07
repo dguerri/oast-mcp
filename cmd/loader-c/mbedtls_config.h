@@ -35,7 +35,9 @@
 
 /* ---- Key exchange ---- */
 #define MBEDTLS_KEY_EXCHANGE_ECDHE_ECDSA_ENABLED
-#define MBEDTLS_KEY_EXCHANGE_ECDHE_RSA_ENABLED
+/* ECDHE_RSA not needed: server cert is ECDSA. RSA_C is kept only because the
+ * Let's Encrypt E7 intermediate is signed by ISRG Root X1 (RSA), so RSA
+ * signature verification is required during X.509 chain validation. */
 #define MBEDTLS_PKCS1_V15
 #define MBEDTLS_RSA_C
 #define MBEDTLS_SSL_SERVER_NAME_INDICATION
