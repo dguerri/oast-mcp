@@ -438,8 +438,8 @@ make test
 
 ```bash
 # Linux loaders (C/musl/mbedTLS, requires Docker):
-#   bin/loader-linux-amd64   ~200 KB
-#   bin/loader-linux-arm64   ~200 KB
+#   bin/loader-linux-amd64   ~91 KB
+#   bin/loader-linux-arm64   ~91 KB
 # Windows loader (Go, no Docker required):
 #   bin/loader-windows-amd64.exe
 make build-loaders   # → bin/loader-{os}-{arch}[.exe]
