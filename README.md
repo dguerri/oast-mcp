@@ -471,3 +471,25 @@ oast-mcp revoke --config /etc/oast-mcp/config.yml --token <jwt>
 ```
 
 The token is recorded in the revocation store and rejected on all subsequent requests.
+
+---
+
+## Comparison with other OAST MCP Servers
+
+| Feature            | `oast-mcp` (This Project)      | `mcp-interactsh`          | `go-roast`             |
+| :----------------- | :----------------------------- | :------------------------ | :--------------------- |
+| **Primary Use Case** | Offensive / Red Teaming        | Offensive / Bug Bounty    | Defensive / Threat Intel|
+| **Testing Paradigm** | Active                         | Active                    | Passive (Forensics)    |
+| **Infrastructure** | Self-Hosted (GCP/Terraform)    | Public / 3rd Party        | Local Data / APIs      |
+| **OAST Callbacks** | DNS, HTTP, HTTPS               | DNS, HTTP, HTTPS, SMTP, ...| N/A (Analyzes logs)    |
+| **Payload Gen**    | Yes (Built-in templates)       | No                        | N/A                    |
+| **Retrieval**      | Blocking Wait                  | Polling                   | N/A                    |
+| **Post-Exploit**   | Yes (Two-stage Agents, RCE)    | No                        | No                     |
+| **Setup Friction** | High (Cloud, DNS, Certs)       | Extremely Low (`npx`)     | Low (Binary install)   |
+| **Data Privacy**   | High (100% Owned)              | Low (if using public fleet)| High (Local analysis)  |
+
+### Summary
+- **`oast-mcp`** is for professional red-teaming where data privacy and a seamless transition from **vulnerability discovery to post-exploitation (RCE)** are required. It is a full-stack platform, not just a wrapper.
+- **`mcp-interactsh`** is ideal for quick, ad-hoc testing and bug hunting where ease of use is more important than owning the underlying infrastructure.
+- **`go-roast`** is a specialized forensic tool for defensive workflows, used to decode and analyze metadata from existing OAST callbacks found in logs or threat intel feeds.
+
