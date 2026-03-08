@@ -293,7 +293,9 @@ func (s *Server) handleConn(ctx context.Context, ws *websocket.Conn) {
 		s.mu.Lock()
 		delete(s.conns, connKey(conn.tenantID, agentID))
 		s.mu.Unlock()
-		if err := s.store.UpdateAgentStatus(ctx, agentID, conn.tenantID, "offline", time.Now().UTC()); err != nil {
+		cleanupCtx, cleanupCancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cleanupCancel()
+		if err := s.store.UpdateAgentStatus(cleanupCtx, agentID, conn.tenantID, "offline", time.Now().UTC()); err != nil {
 			s.logger.Warn("failed to mark agent offline", "agent_id", agentID, "err", err)
 		}
 	}()
