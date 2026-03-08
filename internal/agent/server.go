@@ -111,7 +111,7 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 	ws, err := upgrader.Upgrade(w, r, nil)
 	if err != nil {
-		s.logger.Warn("ws upgrade", "remote_addr", r.RemoteAddr, "user_agent", r.UserAgent(), "err", err)
+		s.logger.Warn("ws upgrade", "remote_addr", r.RemoteAddr, "x_forwarded_for", r.Header.Get("X-Forwarded-For"), "user_agent", r.UserAgent(), "err", err)
 		return
 	}
 	// WebSocket connections outlive the HTTP request, so use Background.
