@@ -264,12 +264,14 @@ func (s *Server) handleConn(ctx context.Context, ws *websocket.Conn) {
 	}
 
 	now := time.Now().UTC()
+	exp := claims.ExpiresAt.UTC()
 	a := &store.Agent{
 		AgentID:      agentID,
 		TenantID:     claims.TenantID,
 		Name:         reg.Name,
 		RegisteredAt: now,
 		LastSeenAt:   &now,
+		ExpiresAt:    &exp,
 		Capabilities: reg.Capabilities,
 		Status:       "online",
 	}

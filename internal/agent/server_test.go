@@ -330,6 +330,28 @@ func TestAgentHeartbeat_UpdatesLastSeen(t *testing.T) {
 	}, 3*time.Second, 50*time.Millisecond, "last_seen_at should be updated after pong")
 }
 
+// TestAgentRegister_SetsExpiresAt verifies that the agent's expires_at is set
+// from the JWT token expiry at registration time.
+func TestAgentRegister_SetsExpiresAt(t *testing.T) {
+	srv, a, st := setupServer(t)
+
+	ttl := 2 * time.Hour
+	token, err := a.IssueAgent("alice", "agent-exp", []string{"agent:connect"}, ttl)
+	require.NoError(t, err)
+
+	connectAgent(t, srv, token, "agent-exp", []string{"exec"})
+
+	require.Eventually(t, func() bool {
+		ag, err := st.GetAgent(context.Background(), "agent-exp", "alice")
+		return err == nil && ag != nil
+	}, 2*time.Second, 50*time.Millisecond)
+
+	ag, err := st.GetAgent(context.Background(), "agent-exp", "alice")
+	require.NoError(t, err)
+	require.NotNil(t, ag.ExpiresAt)
+	assert.WithinDuration(t, time.Now().Add(ttl), *ag.ExpiresAt, 5*time.Second)
+}
+
 // TestHandleConn_ExpiredToken verifies that a token that has already expired
 // is rejected with a "token_expired" error message, not the generic "unauthorized".
 func TestHandleConn_ExpiredToken(t *testing.T) {
