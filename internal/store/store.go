@@ -65,6 +65,7 @@ type Agent struct {
 	Name         string
 	RegisteredAt time.Time
 	LastSeenAt   *time.Time
+	ExpiresAt    *time.Time
 	Capabilities []string
 	Status       string // online|offline
 }

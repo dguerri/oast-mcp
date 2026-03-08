@@ -450,6 +450,25 @@ func TestTasks_TimeoutFieldsPersisted(t *testing.T) {
 	assert.WithinDuration(t, timeoutAt, *got.TimeoutAt, time.Second)
 }
 
+// TestAgents_ExpiresAtPersisted verifies that the expires_at field is stored
+// and retrieved correctly.
+func TestAgents_ExpiresAtPersisted(t *testing.T) {
+	s := newStore(t)
+	now := time.Now().UTC().Truncate(time.Second)
+	exp := now.Add(2 * time.Hour)
+
+	require.NoError(t, s.UpsertAgent(ctx, &store.Agent{
+		AgentID: "exp-agent", TenantID: "alice", Name: "Exp",
+		RegisteredAt: now, Capabilities: []string{"exec"},
+		Status: "online", ExpiresAt: &exp,
+	}))
+
+	got, err := s.GetAgent(ctx, "exp-agent", "alice")
+	require.NoError(t, err)
+	require.NotNil(t, got.ExpiresAt)
+	assert.WithinDuration(t, exp, *got.ExpiresAt, time.Second)
+}
+
 // TestMarkAllAgentsOffline verifies that all agents are set to "offline" and
 // last_seen_at is updated.
 func TestMarkAllAgentsOffline(t *testing.T) {

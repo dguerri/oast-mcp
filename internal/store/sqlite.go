@@ -452,13 +452,14 @@ func (s *SQLiteStore) UpsertAgent(ctx context.Context, a *Agent) error {
 	}
 	_, err = s.db.ExecContext(ctx, `
 		INSERT OR REPLACE INTO agents
-			(agent_id, tenant_id, name, registered_at, last_seen_at, capabilities_json, status)
-		VALUES (?, ?, ?, ?, ?, ?, ?)`,
+			(agent_id, tenant_id, name, registered_at, last_seen_at, expires_at, capabilities_json, status)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
 		a.AgentID,
 		a.TenantID,
 		a.Name,
 		timeToStr(a.RegisteredAt),
 		nullTimeToStr(a.LastSeenAt),
+		nullTimeToStr(a.ExpiresAt),
 		capsJSON,
 		a.Status,
 	)
@@ -467,7 +468,7 @@ func (s *SQLiteStore) UpsertAgent(ctx context.Context, a *Agent) error {
 
 func (s *SQLiteStore) GetAgent(ctx context.Context, agentID, tenantID string) (*Agent, error) {
 	row := s.db.QueryRowContext(ctx, `
-		SELECT agent_id, tenant_id, name, registered_at, last_seen_at, capabilities_json, status
+		SELECT agent_id, tenant_id, name, registered_at, last_seen_at, expires_at, capabilities_json, status
 		FROM agents
 		WHERE agent_id = ? AND tenant_id = ?`,
 		agentID, tenantID,
@@ -477,7 +478,7 @@ func (s *SQLiteStore) GetAgent(ctx context.Context, agentID, tenantID string) (*
 
 func (s *SQLiteStore) ListAgents(ctx context.Context, tenantID string) ([]*Agent, error) {
 	rows, err := s.db.QueryContext(ctx, `
-		SELECT agent_id, tenant_id, name, registered_at, last_seen_at, capabilities_json, status
+		SELECT agent_id, tenant_id, name, registered_at, last_seen_at, expires_at, capabilities_json, status
 		FROM agents
 		WHERE tenant_id = ?
 		ORDER BY registered_at DESC`,
@@ -518,6 +519,7 @@ func scanAgent(row scanner) (*Agent, error) {
 		a             Agent
 		registeredAtS string
 		lastSeenAtS   *string
+		expiresAtS    *string
 		capsJSON      string
 	)
 	err := row.Scan(
@@ -526,6 +528,7 @@ func scanAgent(row scanner) (*Agent, error) {
 		&a.Name,
 		&registeredAtS,
 		&lastSeenAtS,
+		&expiresAtS,
 		&capsJSON,
 		&a.Status,
 	)
@@ -539,6 +542,9 @@ func scanAgent(row scanner) (*Agent, error) {
 		return nil, err
 	}
 	if a.LastSeenAt, err = strToNullTime(lastSeenAtS); err != nil {
+		return nil, err
+	}
+	if a.ExpiresAt, err = strToNullTime(expiresAtS); err != nil {
 		return nil, err
 	}
 	if capsJSON != "" {
