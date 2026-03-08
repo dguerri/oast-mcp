@@ -244,13 +244,15 @@ func (n *Native) startDNS(ctx context.Context) error {
 	}()
 
 	timeout := time.After(2 * time.Second)
-	for range 2 {
-		select {
-		case <-udpStarted:
-		case <-tcpStarted:
-		case <-timeout:
-			return fmt.Errorf("dns server did not start within 2s")
-		}
+	select {
+	case <-udpStarted:
+	case <-timeout:
+		return fmt.Errorf("dns udp server did not start within 2s")
+	}
+	select {
+	case <-tcpStarted:
+	case <-timeout:
+		return fmt.Errorf("dns tcp server did not start within 2s")
 	}
 	return nil
 }
