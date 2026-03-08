@@ -107,7 +107,7 @@ type Store interface {
 	// Agents (tenant-scoped)
 	UpsertAgent(ctx context.Context, a *Agent) error
 	GetAgent(ctx context.Context, agentID, tenantID string) (*Agent, error)
-	ListAgents(ctx context.Context, tenantID string) ([]*Agent, error)
+	ListAgents(ctx context.Context, tenantID string, includeExpired bool) ([]*Agent, error)
 	UpdateAgentStatus(ctx context.Context, agentID, tenantID, status string, lastSeen time.Time) error
 	MarkAllAgentsOffline(ctx context.Context) error
 

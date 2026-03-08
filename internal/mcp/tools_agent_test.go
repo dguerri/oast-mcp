@@ -225,6 +225,46 @@ func TestAgentTaskStatus_WrongTenant(t *testing.T) {
 	assert.Contains(t, getResultText(t, result), "task not found")
 }
 
+// TestAgentList_ExcludesExpiredByDefault verifies that expired agents are
+// hidden by default and shown when show_expired=true.
+func TestAgentList_ExcludesExpiredByDefault(t *testing.T) {
+	srv, a, st, _ := newTestServer(t)
+
+	now := time.Now().UTC()
+	past := now.Add(-time.Hour)
+	future := now.Add(time.Hour)
+
+	require.NoError(t, st.UpsertAgent(context.Background(), &store.Agent{
+		AgentID: "alive", TenantID: "alice", Name: "Alive",
+		RegisteredAt: now, Capabilities: []string{"exec"},
+		Status: "online", ExpiresAt: &future,
+	}))
+	require.NoError(t, st.UpsertAgent(context.Background(), &store.Agent{
+		AgentID: "dead", TenantID: "alice", Name: "Dead",
+		RegisteredAt: now, Capabilities: []string{"exec"},
+		Status: "offline", ExpiresAt: &past,
+	}))
+
+	aliceCtx := makeCtx(t, a, "alice", []string{"agent:admin"})
+
+	// Default: only non-expired
+	result, err := srv.CallTool(aliceCtx, "agent_list", nil)
+	require.NoError(t, err)
+	require.False(t, result.IsError, getResultText(t, result))
+	items := extractJSONArray(t, result)
+	assert.Len(t, items, 1)
+	assert.Equal(t, "alive", items[0].(map[string]any)["agent_id"])
+
+	// show_expired=true: both
+	result, err = srv.CallTool(aliceCtx, "agent_list", map[string]any{
+		"show_expired": true,
+	})
+	require.NoError(t, err)
+	require.False(t, result.IsError, getResultText(t, result))
+	items = extractJSONArray(t, result)
+	assert.Len(t, items, 2)
+}
+
 // newDropperServer creates an MCP server whose binDir contains a stub loader
 // binary for "linux-amd64". Use this for agent_dropper_generate tests.
 func newDropperServer(t *testing.T) (*mcpsrv.Server, *auth.Auth) {

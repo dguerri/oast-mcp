@@ -476,14 +476,20 @@ func (s *SQLiteStore) GetAgent(ctx context.Context, agentID, tenantID string) (*
 	return scanAgent(row)
 }
 
-func (s *SQLiteStore) ListAgents(ctx context.Context, tenantID string) ([]*Agent, error) {
-	rows, err := s.db.QueryContext(ctx, `
+func (s *SQLiteStore) ListAgents(ctx context.Context, tenantID string, includeExpired bool) ([]*Agent, error) {
+	query := `
 		SELECT agent_id, tenant_id, name, registered_at, last_seen_at, expires_at, capabilities_json, status
 		FROM agents
-		WHERE tenant_id = ?
-		ORDER BY registered_at DESC`,
-		tenantID,
-	)
+		WHERE tenant_id = ?`
+	args := []any{tenantID}
+
+	if !includeExpired {
+		query += ` AND (expires_at IS NULL OR expires_at > ?)`
+		args = append(args, timeToStr(time.Now().UTC()))
+	}
+	query += ` ORDER BY registered_at DESC`
+
+	rows, err := s.db.QueryContext(ctx, query, args...)
 	if err != nil {
 		return nil, err
 	}

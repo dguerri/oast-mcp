@@ -197,11 +197,11 @@ func TestAgents_TenantIsolation(t *testing.T) {
 	assert.ErrorIs(t, err, store.ErrNotFound)
 
 	// list scoped
-	aliceAgents, err := s.ListAgents(ctx, "alice")
+	aliceAgents, err := s.ListAgents(ctx, "alice", true)
 	require.NoError(t, err)
 	assert.Len(t, aliceAgents, 1)
 
-	bobAgents, err := s.ListAgents(ctx, "bob")
+	bobAgents, err := s.ListAgents(ctx, "bob", true)
 	require.NoError(t, err)
 	assert.Len(t, bobAgents, 0)
 }
@@ -467,6 +467,47 @@ func TestAgents_ExpiresAtPersisted(t *testing.T) {
 	require.NoError(t, err)
 	require.NotNil(t, got.ExpiresAt)
 	assert.WithinDuration(t, exp, *got.ExpiresAt, time.Second)
+}
+
+// TestListAgents_ExcludesExpiredByDefault verifies that ListAgents with
+// includeExpired=false omits agents whose expires_at is in the past.
+func TestListAgents_ExcludesExpiredByDefault(t *testing.T) {
+	s := newStore(t)
+	now := time.Now().UTC()
+	past := now.Add(-time.Hour)
+	future := now.Add(time.Hour)
+
+	require.NoError(t, s.UpsertAgent(ctx, &store.Agent{
+		AgentID: "active", TenantID: "alice", Name: "Active",
+		RegisteredAt: now, Capabilities: []string{"exec"},
+		Status: "offline", ExpiresAt: &future,
+	}))
+	require.NoError(t, s.UpsertAgent(ctx, &store.Agent{
+		AgentID: "expired", TenantID: "alice", Name: "Expired",
+		RegisteredAt: now, Capabilities: []string{"exec"},
+		Status: "offline", ExpiresAt: &past,
+	}))
+	require.NoError(t, s.UpsertAgent(ctx, &store.Agent{
+		AgentID: "no-expiry", TenantID: "alice", Name: "NoExpiry",
+		RegisteredAt: now, Capabilities: []string{"exec"},
+		Status: "offline",
+	}))
+
+	// Default: exclude expired
+	agents, err := s.ListAgents(ctx, "alice", false)
+	require.NoError(t, err)
+	ids := make([]string, len(agents))
+	for i, a := range agents {
+		ids[i] = a.AgentID
+	}
+	assert.Contains(t, ids, "active")
+	assert.Contains(t, ids, "no-expiry")
+	assert.NotContains(t, ids, "expired")
+
+	// Include expired
+	agents, err = s.ListAgents(ctx, "alice", true)
+	require.NoError(t, err)
+	assert.Len(t, agents, 3)
 }
 
 // TestMarkAllAgentsOffline verifies that all agents are set to "offline" and

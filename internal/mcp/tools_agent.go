@@ -35,9 +35,11 @@ import (
 // registerAgentTools registers all agent management tools with the MCP server.
 func (s *Server) registerAgentTools() {
 	listTool := mcpgo.NewTool("agent_list",
-		mcpgo.WithDescription("List all agents registered for the current tenant. "+
-			"Returns agent_id, status ('online'/'offline'), capabilities, and last_seen_at. "+
-			"Call this after agent_dropper_generate to confirm the agent appears as 'online' before scheduling tasks."),
+		mcpgo.WithDescription("List agents registered for the current tenant. "+
+			"By default, agents whose token has expired are hidden. "+
+			"Pass show_expired=true to include them. "+
+			"Returns agent_id, status ('online'/'offline'), capabilities, expires_at, and last_seen_at."),
+		mcpgo.WithBoolean("show_expired", mcpgo.Description("Include agents whose token has expired (default: false)")),
 	)
 
 	scheduleTool := mcpgo.NewTool("agent_task_schedule",
@@ -150,7 +152,14 @@ func (s *Server) handleAgentList(ctx context.Context, req mcpgo.CallToolRequest)
 		return toolError("rate limit exceeded")
 	}
 
-	agents, err := s.store.ListAgents(ctx, claims.TenantID)
+	var showExpired bool
+	if args := req.GetArguments(); args != nil {
+		if v, ok := args["show_expired"]; ok {
+			showExpired, _ = v.(bool)
+		}
+	}
+
+	agents, err := s.store.ListAgents(ctx, claims.TenantID, showExpired)
 	if err != nil {
 		s.logger.Error("failed to list agents", "error", err)
 		return toolError("failed to list agents: " + err.Error())
@@ -171,6 +180,7 @@ func (s *Server) handleAgentList(ctx context.Context, req mcpgo.CallToolRequest)
 		Capabilities []string `json:"capabilities"`
 		RegisteredAt string   `json:"registered_at"`
 		LastSeenAt   *string  `json:"last_seen_at,omitempty"`
+		ExpiresAt    *string  `json:"expires_at,omitempty"`
 	}
 
 	views := make([]agentView, 0, len(agents))
@@ -186,6 +196,10 @@ func (s *Server) handleAgentList(ctx context.Context, req mcpgo.CallToolRequest)
 		if a.LastSeenAt != nil {
 			ls := a.LastSeenAt.Format(time.RFC3339)
 			v.LastSeenAt = &ls
+		}
+		if a.ExpiresAt != nil {
+			ea := a.ExpiresAt.Format(time.RFC3339)
+			v.ExpiresAt = &ea
 		}
 		views = append(views, v)
 	}
