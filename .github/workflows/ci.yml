@@ -6,6 +6,9 @@ on:
   pull_request:
     branches: [main]
 
+permissions:
+  contents: read
+
 jobs:
   go:
     name: Go – build / test / lint / cover
@@ -19,22 +22,16 @@ jobs:
           go-version-file: go.mod
           cache: true
 
-      - name: Build
-        run: go build ./...
-
-      - name: Test (race detector)
-        run: go test ./... -race -count=1 -timeout=60s
+      - name: Test (race detector + coverage)
+        run: |
+          go test ./... -race -count=1 -timeout=60s \
+            -coverprofile=coverage.out -covermode=atomic \
+            -coverpkg=./internal/...
 
       - name: Lint
         uses: golangci/golangci-lint-action@v6
         with:
-          version: latest
-
-      - name: Coverage
-        run: |
-          go test ./internal/... -race -count=1 -timeout=60s \
-            -coverprofile=coverage.out -covermode=atomic \
-            -coverpkg=./internal/...
+          version: v1.64.8
 
       - name: Upload coverage to Codecov
         uses: codecov/codecov-action@v5
