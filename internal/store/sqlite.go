@@ -17,80 +17,18 @@ package store
 import (
 	"context"
 	"database/sql"
+	"embed"
 	"encoding/json"
 	"fmt"
+	"sort"
 	"strings"
 	"time"
 
 	_ "modernc.org/sqlite"
 )
 
-const schema = `
-CREATE TABLE IF NOT EXISTS sessions (
-    session_id TEXT PRIMARY KEY,
-    tenant_id  TEXT NOT NULL,
-    correlation_id TEXT NOT NULL,
-    created_at TEXT NOT NULL,
-    expires_at TEXT NOT NULL,
-    closed_at  TEXT,
-    cursor     TEXT NOT NULL DEFAULT '',
-    tags_json  TEXT NOT NULL DEFAULT '[]'
-);
-CREATE INDEX IF NOT EXISTS idx_sess_tenant ON sessions(tenant_id);
-
-CREATE TABLE IF NOT EXISTS events (
-    event_id    TEXT PRIMARY KEY,
-    session_id  TEXT NOT NULL,
-    tenant_id   TEXT NOT NULL,
-    received_at TEXT NOT NULL,
-    protocol    TEXT NOT NULL,
-    src_ip      TEXT NOT NULL DEFAULT '',
-    data_json   TEXT NOT NULL DEFAULT '{}'
-);
-CREATE INDEX IF NOT EXISTS idx_ev_session ON events(session_id, received_at, event_id);
-
-CREATE TABLE IF NOT EXISTS token_revocations (
-    jti        TEXT PRIMARY KEY,
-    revoked_at TEXT NOT NULL,
-    expires_at TEXT NOT NULL
-);
-
--- NOTE: existing databases must recreate this table to change the primary key.
--- SQLite does not support ALTER TABLE ... DROP CONSTRAINT / ADD PRIMARY KEY.
--- Migration: rename old table, create new, copy data, drop old.
-CREATE TABLE IF NOT EXISTS agents (
-    agent_id          TEXT NOT NULL,
-    tenant_id         TEXT NOT NULL,
-    name              TEXT NOT NULL,
-    registered_at     TEXT NOT NULL,
-    last_seen_at      TEXT,
-    capabilities_json TEXT NOT NULL DEFAULT '[]',
-    status            TEXT NOT NULL DEFAULT 'offline',
-    PRIMARY KEY (agent_id, tenant_id)
-);
-CREATE INDEX IF NOT EXISTS idx_agent_tenant ON agents(tenant_id);
-
-CREATE TABLE IF NOT EXISTS tasks (
-    task_id      TEXT PRIMARY KEY,
-    agent_id     TEXT NOT NULL,
-    tenant_id    TEXT NOT NULL,
-    scheduled_by TEXT NOT NULL,
-    capability   TEXT NOT NULL,
-    params_json  TEXT NOT NULL DEFAULT '{}',
-    status       TEXT NOT NULL DEFAULT 'pending',
-    created_at   TEXT NOT NULL,
-    started_at   TEXT,
-    completed_at TEXT,
-    timeout_at   TEXT,
-    timeout_secs INTEGER NOT NULL DEFAULT 600,
-    result_json  TEXT,
-    error        TEXT NOT NULL DEFAULT ''
-);
-CREATE INDEX IF NOT EXISTS idx_task_agent_status ON tasks(agent_id, status, created_at);
-CREATE INDEX IF NOT EXISTS idx_task_tenant ON tasks(tenant_id);
-CREATE INDEX IF NOT EXISTS idx_task_timeout ON tasks(timeout_at) WHERE status IN ('pending','running');
-
-`
+//go:embed migrations/sqlite/*.sql
+var migrationsFS embed.FS
 
 // SQLiteStore is a multi-tenant SQLite-backed implementation of Store.
 type SQLiteStore struct {
@@ -107,18 +45,75 @@ func addPragmas(dsn string) string {
 	return dsn + sep + "_pragma=journal_mode(WAL)&_pragma=foreign_keys(ON)"
 }
 
-// migrations contains additive DDL statements applied to existing databases.
-// Each entry uses a plain ALTER TABLE ADD COLUMN (without IF NOT EXISTS, which
-// older SQLite versions do not support). Errors whose message contains
-// "duplicate column name" are silently ignored — they simply mean the column
-// was already added by a previous migration or by the initial schema.
-var migrations = []string{
-	// v2: task timeouts
-	`ALTER TABLE tasks ADD COLUMN timeout_at TEXT`,
-	`ALTER TABLE tasks ADD COLUMN timeout_secs INTEGER NOT NULL DEFAULT 600`,
+// migrate creates the schema_migrations tracking table and applies any
+// unapplied .sql files from the embedded migrations directory, in
+// lexicographic order (0000_initial_schema.sql, 0001_..., etc.).
+func migrate(db *sql.DB) error {
+	if _, err := db.Exec(`CREATE TABLE IF NOT EXISTS schema_migrations (
+		version TEXT PRIMARY KEY,
+		applied_at TEXT NOT NULL
+	)`); err != nil {
+		return fmt.Errorf("create schema_migrations: %w", err)
+	}
+
+	entries, err := migrationsFS.ReadDir("migrations/sqlite")
+	if err != nil {
+		return fmt.Errorf("read migrations dir: %w", err)
+	}
+	sort.Slice(entries, func(i, j int) bool {
+		return entries[i].Name() < entries[j].Name()
+	})
+
+	for _, e := range entries {
+		name := e.Name()
+		if !strings.HasSuffix(name, ".sql") {
+			continue
+		}
+		version := strings.TrimSuffix(name, ".sql")
+
+		var count int
+		if err := db.QueryRow(
+			`SELECT COUNT(*) FROM schema_migrations WHERE version = ?`, version,
+		).Scan(&count); err != nil {
+			return fmt.Errorf("check migration %s: %w", version, err)
+		}
+		if count > 0 {
+			continue
+		}
+
+		sqlBytes, err := migrationsFS.ReadFile("migrations/sqlite/" + name)
+		if err != nil {
+			return fmt.Errorf("read migration %s: %w", name, err)
+		}
+
+		if _, err := db.Exec(string(sqlBytes)); err != nil {
+			// Tolerate benign errors from re-running idempotent DDL on
+			// databases that predate the migration tracking table.
+			if !isBenignDDLError(err) {
+				return fmt.Errorf("apply migration %s: %w", version, err)
+			}
+		}
+
+		if _, err := db.Exec(
+			`INSERT INTO schema_migrations (version, applied_at) VALUES (?, ?)`,
+			version, time.Now().UTC().Format(time.RFC3339),
+		); err != nil {
+			return fmt.Errorf("record migration %s: %w", version, err)
+		}
+	}
+	return nil
 }
 
-// NewSQLite opens (or creates) a SQLite database at the given DSN and applies the schema.
+// isBenignDDLError returns true for errors that indicate DDL was already
+// applied (e.g. duplicate column from a prior ALTER TABLE).
+func isBenignDDLError(err error) bool {
+	msg := err.Error()
+	return strings.Contains(msg, "duplicate column name") ||
+		strings.Contains(msg, "already exists")
+}
+
+// NewSQLite opens (or creates) a SQLite database at the given DSN and applies
+// all pending migrations.
 func NewSQLite(dsn string) (*SQLiteStore, error) {
 	db, err := sql.Open("sqlite", addPragmas(dsn))
 	if err != nil {
@@ -127,18 +122,9 @@ func NewSQLite(dsn string) (*SQLiteStore, error) {
 	// Single writer to avoid SQLITE_BUSY with WAL.
 	db.SetMaxOpenConns(1)
 
-	if _, err := db.Exec(schema); err != nil {
+	if err := migrate(db); err != nil {
 		_ = db.Close()
-		return nil, fmt.Errorf("apply schema: %w", err)
-	}
-	// Apply additive migrations; ignore "duplicate column name" errors.
-	for _, m := range migrations {
-		if _, err := db.Exec(m); err != nil {
-			if !strings.Contains(err.Error(), "duplicate column name") {
-				_ = db.Close()
-				return nil, fmt.Errorf("migration %q: %w", m, err)
-			}
-		}
+		return nil, err
 	}
 	return &SQLiteStore{db: db}, nil
 }
