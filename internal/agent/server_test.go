@@ -40,6 +40,7 @@ func setupServer(t *testing.T) (*agent.Server, *auth.Auth, store.Store) {
 	t.Cleanup(func() { st.Close() })
 	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
 	srv := agent.NewServer(a, st, logger, t.TempDir())
+	srv.PingInterval = 500 * time.Millisecond
 	return srv, a, st
 }
 
@@ -64,6 +65,21 @@ func connectAgent(t *testing.T, srv *agent.Server, token, agentID string, caps [
 	})
 	require.NoError(t, err)
 	return conn, ts
+}
+
+// readNonPing reads the next JSON message from the WebSocket, skipping any
+// server-initiated ping messages. Tests that expect a specific message type
+// should use this instead of conn.ReadJSON to avoid flakes from interleaved
+// heartbeat pings.
+func readNonPing(t *testing.T, conn *websocket.Conn) map[string]any {
+	t.Helper()
+	for {
+		var msg map[string]any
+		require.NoError(t, conn.ReadJSON(&msg))
+		if msg["type"] != "ping" {
+			return msg
+		}
+	}
 }
 
 // TestAgentRegister_MissingAgentIDClaim verifies that a token minted without
@@ -173,8 +189,7 @@ func TestAgentTask_Dispatch_E2E(t *testing.T) {
 	require.NoError(t, st.EnqueueTask(context.Background(), task))
 
 	require.NoError(t, conn.SetReadDeadline(time.Now().Add(5*time.Second)))
-	var taskMsg map[string]any
-	require.NoError(t, conn.ReadJSON(&taskMsg), "agent should receive the task message")
+	taskMsg := readNonPing(t, conn)
 	assert.Equal(t, "task", taskMsg["type"])
 	assert.Equal(t, "task-e2e-1", taskMsg["task_id"])
 	assert.Equal(t, "exec", taskMsg["capability"])
@@ -235,8 +250,7 @@ func TestAgentTask_TenantIsolation(t *testing.T) {
 	require.NoError(t, st.EnqueueTask(context.Background(), aliceTask))
 
 	require.NoError(t, aliceConn.SetReadDeadline(time.Now().Add(5*time.Second)))
-	var msg map[string]any
-	require.NoError(t, aliceConn.ReadJSON(&msg))
+	msg := readNonPing(t, aliceConn)
 	assert.Equal(t, "task-alice-iso", msg["task_id"],
 		"alice's agent must only receive her own tasks")
 }
@@ -315,7 +329,7 @@ func TestAgentHeartbeat_UpdatesLastSeen(t *testing.T) {
 	initialLastSeen := *initialAgent.LastSeenAt
 
 	// Read the server-initiated ping.
-	require.NoError(t, conn.SetReadDeadline(time.Now().Add(35*time.Second)))
+	require.NoError(t, conn.SetReadDeadline(time.Now().Add(5*time.Second)))
 	var msg map[string]any
 	require.NoError(t, conn.ReadJSON(&msg))
 	assert.Equal(t, "ping", msg["type"])

@@ -72,6 +72,8 @@ type Server struct {
 	logger *slog.Logger
 	binDir string
 
+	PingInterval time.Duration
+
 	mu    sync.RWMutex
 	conns map[string]*agentConn // "tenantID/agentID" → connection
 }
@@ -89,10 +91,11 @@ type agentConn struct {
 // NewServer creates an agent WebSocket server backed by the given auth, store, and binary directory.
 func NewServer(a *auth.Auth, st store.Store, logger *slog.Logger, binDir string) *Server {
 	return &Server{
-		auth:   a,
-		store:  st,
-		logger: logger,
-		binDir: binDir,
+		auth:         a,
+		store:        st,
+		logger:       logger,
+		binDir:       binDir,
+		PingInterval: pingInterval,
 		conns:  make(map[string]*agentConn),
 	}
 }
@@ -356,7 +359,7 @@ func (s *Server) writeLoop(ctx context.Context, conn *agentConn) {
 // pingLoop sends periodic pings to the agent. The readLoop updates
 // last_seen_at when the agent responds with a pong.
 func (s *Server) pingLoop(ctx context.Context, conn *agentConn) {
-	ticker := time.NewTicker(pingInterval)
+	ticker := time.NewTicker(s.PingInterval)
 	defer ticker.Stop()
 	for {
 		select {
