@@ -366,6 +366,36 @@ func TestAgentRegister_SetsExpiresAt(t *testing.T) {
 	assert.WithinDuration(t, time.Now().Add(ttl), *ag.ExpiresAt, 5*time.Second)
 }
 
+// TestAgentDisconnect_MarksOffline verifies that when an agent's WebSocket
+// connection is closed, the server marks the agent as offline in the store.
+// This also tests that the cleanup defer uses a fresh context (not the
+// cancelled connection context).
+func TestAgentDisconnect_MarksOffline(t *testing.T) {
+	srv, a, st := setupServer(t)
+
+	token, err := a.IssueAgent("alice", "agent-disconnect", []string{"agent:connect"}, time.Hour)
+	require.NoError(t, err)
+
+	conn, _ := connectAgent(t, srv, token, "agent-disconnect", []string{"exec"})
+
+	require.Eventually(t, func() bool {
+		ag, err := st.GetAgent(context.Background(), "agent-disconnect", "alice")
+		return err == nil && ag != nil && ag.Status == "online"
+	}, 2*time.Second, 50*time.Millisecond, "agent should be online")
+
+	// Close the WebSocket connection.
+	require.NoError(t, conn.WriteMessage(
+		websocket.CloseMessage,
+		websocket.FormatCloseMessage(websocket.CloseNormalClosure, ""),
+	))
+
+	// Agent should transition to offline.
+	require.Eventually(t, func() bool {
+		ag, err := st.GetAgent(context.Background(), "agent-disconnect", "alice")
+		return err == nil && ag.Status == "offline"
+	}, 3*time.Second, 50*time.Millisecond, "agent should be marked offline after disconnect")
+}
+
 // TestHandleConn_ExpiredToken verifies that a token that has already expired
 // is rejected with a "token_expired" error message, not the generic "unauthorized".
 func TestHandleConn_ExpiredToken(t *testing.T) {

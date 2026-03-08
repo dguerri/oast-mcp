@@ -15,12 +15,14 @@
 package mcp_test
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"io"
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 	"time"
 
@@ -49,6 +51,24 @@ func newTestServer(t *testing.T) (*mcpsrv.Server, *auth.Auth, store.Store, *oast
 	return srv, a, st, mock
 }
 
+// newTestServerWithAuditBuf is like newTestServer but writes audit events to
+// the returned buffer so tests can inspect them.
+func newTestServerWithAuditBuf(t *testing.T) (*mcpsrv.Server, *auth.Auth, store.Store, *oast.Mock, *bytes.Buffer) {
+	t.Helper()
+	key := make([]byte, 32)
+	a := auth.New(key)
+	st, err := store.NewSQLite(":memory:")
+	require.NoError(t, err)
+	t.Cleanup(func() { st.Close() })
+	mock := oast.NewMock(st, "oast.example.com")
+	rl := ratelimit.New(100, 100)
+	var buf bytes.Buffer
+	al := audit.New(&buf)
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	srv := mcpsrv.NewServer(a, st, mock, rl, al, logger, "oast.example.com", "mcp.example.com", "agent.example.com", t.TempDir())
+	return srv, a, st, mock, &buf
+}
+
 // makeCtx creates a context with the given claims injected directly using
 // the exported ContextWithClaims helper so the server can find them.
 func makeCtx(t *testing.T, a *auth.Auth, subject string, scopes []string) context.Context {
@@ -58,6 +78,29 @@ func makeCtx(t *testing.T, a *auth.Auth, subject string, scopes []string) contex
 	claims, err := a.Validate(token)
 	require.NoError(t, err)
 	return mcpsrv.ContextWithClaims(context.Background(), claims)
+}
+
+// makeCtxWithRequestInfo creates a context with both claims and client network
+// info, simulating a request that came through the HTTP middleware.
+func makeCtxWithRequestInfo(t *testing.T, a *auth.Auth, subject string, scopes []string, remoteAddr, xForwardedFor string) context.Context {
+	t.Helper()
+	ctx := makeCtx(t, a, subject, scopes)
+	return mcpsrv.ContextWithRequestInfo(ctx, remoteAddr, xForwardedFor)
+}
+
+// parseAuditLines parses newline-delimited JSON audit events from a buffer.
+func parseAuditLines(t *testing.T, buf *bytes.Buffer) []map[string]any {
+	t.Helper()
+	var events []map[string]any
+	for _, line := range strings.Split(strings.TrimSpace(buf.String()), "\n") {
+		if line == "" {
+			continue
+		}
+		var ev map[string]any
+		require.NoError(t, json.Unmarshal([]byte(line), &ev))
+		events = append(events, ev)
+	}
+	return events
 }
 
 // TestCreateSession_ReturnsEndpoints verifies that creating a session returns
@@ -540,6 +583,150 @@ func insertExpiredSession(t *testing.T, st store.Store, tenantID string) string 
 	})
 	require.NoError(t, err)
 	return sessID
+}
+
+// ── Audit logging tests ───────────────────────────────────────────────────────
+
+// TestAuditEvent_IncludesRemoteAddr verifies that audit events emitted by MCP
+// tools include remote_addr and x_forwarded_for when requestInfo is in context.
+func TestAuditEvent_IncludesRemoteAddr(t *testing.T) {
+	srv, a, _, _, buf := newTestServerWithAuditBuf(t)
+	ctx := makeCtxWithRequestInfo(t, a, "alice", []string{"oast:write", "oast:read"},
+		"10.0.0.1:12345", "203.0.113.42")
+
+	result, err := srv.CallTool(ctx, "oast_create_session", nil)
+	require.NoError(t, err)
+	require.False(t, result.IsError, getResultText(t, result))
+
+	events := parseAuditLines(t, buf)
+	require.NotEmpty(t, events, "should have at least one audit event")
+
+	// Find the session.create/ok event
+	var found bool
+	for _, ev := range events {
+		if ev["action"] == "session.create" && ev["outcome"] == "ok" {
+			assert.Equal(t, "10.0.0.1:12345", ev["remote_addr"])
+			assert.Equal(t, "203.0.113.42", ev["x_forwarded_for"])
+			assert.Equal(t, "alice", ev["tenant_id"])
+			found = true
+			break
+		}
+	}
+	assert.True(t, found, "session.create/ok audit event not found")
+}
+
+// TestAuditEvent_DeniedIncludesRemoteAddr verifies that denied audit events
+// also include remote_addr and x_forwarded_for.
+func TestAuditEvent_DeniedIncludesRemoteAddr(t *testing.T) {
+	srv, a, _, _, buf := newTestServerWithAuditBuf(t)
+	// Use oast:read scope only — session.create requires oast:write
+	ctx := makeCtxWithRequestInfo(t, a, "alice", []string{"oast:read"},
+		"192.168.1.100:9999", "198.51.100.5")
+
+	result, err := srv.CallTool(ctx, "oast_create_session", nil)
+	require.NoError(t, err)
+	require.True(t, result.IsError, "should be denied without oast:write scope")
+
+	events := parseAuditLines(t, buf)
+	require.NotEmpty(t, events)
+
+	var found bool
+	for _, ev := range events {
+		if ev["action"] == "session.create" && ev["outcome"] == "denied" {
+			assert.Equal(t, "192.168.1.100:9999", ev["remote_addr"])
+			assert.Equal(t, "198.51.100.5", ev["x_forwarded_for"])
+			found = true
+			break
+		}
+	}
+	assert.True(t, found, "session.create/denied audit event not found")
+}
+
+// TestAuditEvent_EmptyWithoutRequestInfo verifies that audit events have empty
+// remote_addr and x_forwarded_for when no requestInfo is in context.
+func TestAuditEvent_EmptyWithoutRequestInfo(t *testing.T) {
+	srv, a, _, _, buf := newTestServerWithAuditBuf(t)
+	// Use makeCtx (no requestInfo)
+	ctx := makeCtx(t, a, "alice", []string{"oast:write", "oast:read"})
+
+	result, err := srv.CallTool(ctx, "oast_create_session", nil)
+	require.NoError(t, err)
+	require.False(t, result.IsError, getResultText(t, result))
+
+	events := parseAuditLines(t, buf)
+	require.NotEmpty(t, events)
+
+	for _, ev := range events {
+		if ev["action"] == "session.create" && ev["outcome"] == "ok" {
+			// remote_addr and x_forwarded_for should be omitted (omitempty)
+			assert.Nil(t, ev["remote_addr"], "remote_addr should be omitted when empty")
+			assert.Nil(t, ev["x_forwarded_for"], "x_forwarded_for should be omitted when empty")
+			return
+		}
+	}
+	t.Fatal("session.create/ok audit event not found")
+}
+
+// TestAuditEvent_AgentToolIncludesRemoteAddr verifies that agent tools also
+// include remote_addr in audit events.
+func TestAuditEvent_AgentToolIncludesRemoteAddr(t *testing.T) {
+	srv, a, _, _, buf := newTestServerWithAuditBuf(t)
+	ctx := makeCtxWithRequestInfo(t, a, "alice", []string{"agent:admin"},
+		"172.16.0.5:54321", "10.10.10.1, 203.0.113.99")
+
+	result, err := srv.CallTool(ctx, "agent_list", nil)
+	require.NoError(t, err)
+	require.False(t, result.IsError, getResultText(t, result))
+
+	events := parseAuditLines(t, buf)
+	require.NotEmpty(t, events)
+
+	var found bool
+	for _, ev := range events {
+		if ev["action"] == "agent.list" && ev["outcome"] == "ok" {
+			assert.Equal(t, "172.16.0.5:54321", ev["remote_addr"])
+			assert.Equal(t, "10.10.10.1, 203.0.113.99", ev["x_forwarded_for"])
+			found = true
+			break
+		}
+	}
+	assert.True(t, found, "agent.list/ok audit event not found")
+}
+
+// TestAuditEvent_WaitForEventIncludesRemoteAddr verifies that the deferred
+// audit event in oast_wait_for_event also includes request info.
+func TestAuditEvent_WaitForEventIncludesRemoteAddr(t *testing.T) {
+	srv, a, _, _, buf := newTestServerWithAuditBuf(t)
+	ctx := makeCtxWithRequestInfo(t, a, "alice", []string{"oast:write", "oast:read"},
+		"10.0.0.2:8080", "203.0.113.50")
+
+	createResult, err := srv.CallTool(ctx, "oast_create_session", nil)
+	require.NoError(t, err)
+	sessionID := extractField(t, createResult, "session_id")
+
+	// Clear buffer so we only see wait events
+	buf.Reset()
+
+	_, err = srv.CallTool(ctx, "oast_wait_for_event", map[string]any{
+		"session_id":      sessionID,
+		"timeout_seconds": float64(1),
+	})
+	require.NoError(t, err)
+
+	events := parseAuditLines(t, buf)
+	require.NotEmpty(t, events)
+
+	var found bool
+	for _, ev := range events {
+		if ev["action"] == "session.wait" {
+			assert.Equal(t, "10.0.0.2:8080", ev["remote_addr"])
+			assert.Equal(t, "203.0.113.50", ev["x_forwarded_for"])
+			assert.Equal(t, sessionID, ev["resource"])
+			found = true
+			break
+		}
+	}
+	assert.True(t, found, "session.wait audit event not found")
 }
 
 // --- helpers ---
