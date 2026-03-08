@@ -1,10 +1,11 @@
+version: "2"
+
 linters:
   enable:
     - cyclop
     - unused     # unused unexported identifiers / dead code (staticcheck U1000)
-
-linters-settings:
-  cyclop:
-    max-complexity: 15
-    max-package-average-complexity: 8.0
-    skip-tests: true
+  settings:
+    cyclop:
+      max-complexity: 15
+      max-package-average-complexity: 8.0
+      skip-tests: true
