@@ -1,0 +1,53 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  go:
+    name: Go – build / test / lint / cover
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Build
+        run: go build ./...
+
+      - name: Test (race detector)
+        run: go test ./... -race -count=1 -timeout=60s
+
+      - name: Lint
+        uses: golangci/golangci-lint-action@v6
+        with:
+          version: latest
+
+      - name: Coverage
+        run: |
+          go test ./internal/... -race -count=1 -timeout=60s \
+            -coverprofile=coverage.out -covermode=atomic \
+            -coverpkg=./internal/...
+
+      - name: Upload coverage to Codecov
+        uses: codecov/codecov-action@v5
+        with:
+          token: ${{ secrets.CODECOV_TOKEN }}
+          files: coverage.out
+          fail_ci_if_error: true
+
+  c-loader:
+    name: C loader – Docker build (amd64 + arm64)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build C loaders
+        run: make build-loader-c
