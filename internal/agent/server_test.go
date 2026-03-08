@@ -444,6 +444,25 @@ func TestHealthEndpoints(t *testing.T) {
 	}
 }
 
+func TestWSUpgradeFailed(t *testing.T) {
+	srv, _, _ := setupServer(t)
+	srv.WebSocketUpgrader = &websocket.Upgrader{
+		CheckOrigin: func(r *http.Request) bool { return false },
+	}
+	ts := httptest.NewServer(srv)
+	t.Cleanup(ts.Close)
+
+	t.Run("/ws-ftw", func(t *testing.T) {
+		wsURL := "ws" + strings.TrimPrefix(ts.URL, "http") + "/ws-ftw"
+		_, resp, err := websocket.DefaultDialer.Dial(wsURL, nil)
+		if resp != nil {
+			defer func() { _ = resp.Body.Close() }()
+		}
+		require.Error(t, err)
+		assert.ErrorContains(t, err, "websocket: bad handshake")
+	})
+}
+
 // TestDownloadLoader_PublicEndpoint verifies that a loader binary can be
 // downloaded without authentication and returns 200 OK.
 func TestDownloadLoader_PublicEndpoint(t *testing.T) {
@@ -494,6 +513,29 @@ func TestDownloadSecondStage_NoAuth(t *testing.T) {
 	t.Cleanup(ts.Close)
 
 	resp, err := ts.Client().Get(ts.URL + "/dl/second-stage/linux/amd64")
+	require.NoError(t, err)
+	defer func() { _ = resp.Body.Close() }()
+	assert.Equal(t, http.StatusUnauthorized, resp.StatusCode)
+}
+
+// TestDownloadSecondStage_TokenExpired verifies that GET /dl/second-stage/linux/amd64
+// with an expired token returns 401.
+func TestDownloadSecondStage_InvalidToken(t *testing.T) {
+	dir := t.TempDir()
+	key := make([]byte, 32)
+	a := auth.New(key)
+	st, err := store.NewSQLite(":memory:")
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = st.Close() })
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	srv := agent.NewServer(a, st, logger, dir)
+
+	ts := httptest.NewServer(srv)
+	t.Cleanup(ts.Close)
+
+	req, _ := http.NewRequest("GET", ts.URL+"/dl/second-stage/linux/amd64", nil)
+	req.Header.Add("Authorization", "Bearer A.B.C")
+	resp, err := ts.Client().Do(req)
 	require.NoError(t, err)
 	defer func() { _ = resp.Body.Close() }()
 	assert.Equal(t, http.StatusUnauthorized, resp.StatusCode)

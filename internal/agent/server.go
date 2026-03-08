@@ -40,10 +40,6 @@ const reaperInterval = 30 * time.Second
 // pingInterval is how often the server sends a heartbeat ping to each agent.
 const pingInterval = 30 * time.Second
 
-var upgrader = websocket.Upgrader{
-	CheckOrigin: func(r *http.Request) bool { return true },
-}
-
 type inMsg struct {
 	Type         string         `json:"type"`
 	AgentID      string         `json:"agent_id,omitempty"`
@@ -76,6 +72,8 @@ type Server struct {
 
 	mu    sync.RWMutex
 	conns map[string]*agentConn // "tenantID/agentID" → connection
+
+	WebSocketUpgrader *websocket.Upgrader
 }
 
 // connKey returns the compound map key for a connection.
@@ -96,7 +94,10 @@ func NewServer(a *auth.Auth, st store.Store, logger *slog.Logger, binDir string)
 		logger:       logger,
 		binDir:       binDir,
 		PingInterval: pingInterval,
-		conns:  make(map[string]*agentConn),
+		conns:        make(map[string]*agentConn),
+		WebSocketUpgrader: &websocket.Upgrader{
+			CheckOrigin: func(r *http.Request) bool { return true },
+		},
 	}
 }
 
@@ -109,7 +110,7 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		s.handleDownload(w, r)
 		return
 	}
-	ws, err := upgrader.Upgrade(w, r, nil)
+	ws, err := s.WebSocketUpgrader.Upgrade(w, r, nil)
 	if err != nil {
 		s.logger.Warn("ws upgrade", "remote_addr", r.RemoteAddr, "x_forwarded_for", r.Header.Get("X-Forwarded-For"), "user_agent", r.UserAgent(), "err", err)
 		return
