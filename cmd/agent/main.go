@@ -104,10 +104,11 @@ func runOnce() error {
 	}
 	defer conn.Close()
 
-	reg, _ := json.Marshal(map[string]string{
-		"type":     "register",
-		"agent_id": *agentID,
-		"token":    *token,
+	reg, _ := json.Marshal(map[string]any{
+		"type":         "register",
+		"agent_id":     *agentID,
+		"token":        *token,
+		"capabilities": []string{"exec", "read_file", "fetch_url", "system_info"},
 	})
 	if err := conn.WriteMessage(websocket.TextMessage, reg); err != nil {
 		return err
