@@ -23,7 +23,6 @@ import (
 	"github.com/google/uuid"
 	mcpgo "github.com/mark3labs/mcp-go/mcp"
 	mcpserver "github.com/mark3labs/mcp-go/server"
-	"github.com/dguerri/oast-mcp/internal/audit"
 	"github.com/dguerri/oast-mcp/internal/auth"
 	"github.com/dguerri/oast-mcp/internal/store"
 )
@@ -144,12 +143,7 @@ func (s *Server) handleCreateSession(ctx context.Context, req mcpgo.CallToolRequ
 		return toolError("unauthorized")
 	}
 	if err := auth.RequireScope(claims, "oast:write"); err != nil {
-		s.audit.Log(audit.Event{
-			TenantID: claims.TenantID,
-			Subject:  claims.Subject,
-			Action:   "session.create",
-			Outcome:  "denied",
-		})
+		s.audit.Log(s.newAuditEvent(ctx, "session.create", "denied"))
 		return toolError("insufficient scope: oast:write required")
 	}
 	if !s.rl.Allow(claims.TenantID) {
@@ -182,13 +176,9 @@ func (s *Server) handleCreateSession(ctx context.Context, req mcpgo.CallToolRequ
 		return toolError("failed to store session: " + err.Error())
 	}
 
-	s.audit.Log(audit.Event{
-		TenantID: claims.TenantID,
-		Subject:  claims.Subject,
-		Action:   "session.create",
-		Resource: sessionID,
-		Outcome:  "ok",
-	})
+	ev := s.newAuditEvent(ctx, "session.create", "ok")
+	ev.Resource = sessionID
+	s.audit.Log(ev)
 
 	result := map[string]any{
 		"session_id": sessionID,
@@ -212,12 +202,7 @@ func (s *Server) handleListSessions(ctx context.Context, req mcpgo.CallToolReque
 		return toolError("unauthorized")
 	}
 	if err := auth.RequireScope(claims, "oast:read"); err != nil {
-		s.audit.Log(audit.Event{
-			TenantID: claims.TenantID,
-			Subject:  claims.Subject,
-			Action:   "session.list",
-			Outcome:  "denied",
-		})
+		s.audit.Log(s.newAuditEvent(ctx, "session.list", "denied"))
 		return toolError("insufficient scope: oast:read required")
 	}
 	if !s.rl.Allow(claims.TenantID) {
@@ -230,12 +215,7 @@ func (s *Server) handleListSessions(ctx context.Context, req mcpgo.CallToolReque
 		return toolError("failed to list sessions: " + err.Error())
 	}
 
-	s.audit.Log(audit.Event{
-		TenantID: claims.TenantID,
-		Subject:  claims.Subject,
-		Action:   "session.list",
-		Outcome:  "ok",
-	})
+	s.audit.Log(s.newAuditEvent(ctx, "session.list", "ok"))
 
 	type sessionView struct {
 		SessionID string   `json:"session_id"`
@@ -290,12 +270,7 @@ func (s *Server) handleListEvents(ctx context.Context, req mcpgo.CallToolRequest
 		return toolError("unauthorized")
 	}
 	if err := auth.RequireScope(claims, "oast:read"); err != nil {
-		s.audit.Log(audit.Event{
-			TenantID: claims.TenantID,
-			Subject:  claims.Subject,
-			Action:   "session.poll",
-			Outcome:  "denied",
-		})
+		s.audit.Log(s.newAuditEvent(ctx, "session.poll", "denied"))
 		return toolError("insufficient scope: oast:read required")
 	}
 	if !s.rl.Allow(claims.TenantID) {
@@ -340,13 +315,9 @@ func (s *Server) handleListEvents(ctx context.Context, req mcpgo.CallToolRequest
 		}
 	}
 
-	s.audit.Log(audit.Event{
-		TenantID: claims.TenantID,
-		Subject:  claims.Subject,
-		Action:   "session.poll",
-		Resource: sessionID,
-		Outcome:  "ok",
-	})
+	ev := s.newAuditEvent(ctx, "session.poll", "ok")
+	ev.Resource = sessionID
+	s.audit.Log(ev)
 
 	views := toEventViews(events)
 
@@ -364,12 +335,7 @@ func (s *Server) handleCloseSession(ctx context.Context, req mcpgo.CallToolReque
 		return toolError("unauthorized")
 	}
 	if err := auth.RequireScope(claims, "oast:write"); err != nil {
-		s.audit.Log(audit.Event{
-			TenantID: claims.TenantID,
-			Subject:  claims.Subject,
-			Action:   "session.close",
-			Outcome:  "denied",
-		})
+		s.audit.Log(s.newAuditEvent(ctx, "session.close", "denied"))
 		return toolError("insufficient scope: oast:write required")
 	}
 	if !s.rl.Allow(claims.TenantID) {
@@ -390,13 +356,9 @@ func (s *Server) handleCloseSession(ctx context.Context, req mcpgo.CallToolReque
 		return toolError("failed to close session: " + err.Error())
 	}
 
-	s.audit.Log(audit.Event{
-		TenantID: claims.TenantID,
-		Subject:  claims.Subject,
-		Action:   "session.close",
-		Resource: sessionID,
-		Outcome:  "ok",
-	})
+	ev := s.newAuditEvent(ctx, "session.close", "ok")
+	ev.Resource = sessionID
+	s.audit.Log(ev)
 
 	result := map[string]any{
 		"session_id": sessionID,
@@ -412,12 +374,7 @@ func (s *Server) handleWaitForEvent(ctx context.Context, req mcpgo.CallToolReque
 		return toolError("unauthorized")
 	}
 	if err := auth.RequireScope(claims, "oast:read"); err != nil {
-		s.audit.Log(audit.Event{
-			TenantID: claims.TenantID,
-			Subject:  claims.Subject,
-			Action:   "session.wait",
-			Outcome:  "denied",
-		})
+		s.audit.Log(s.newAuditEvent(ctx, "session.wait", "denied"))
 		return toolError("insufficient scope: oast:read required")
 	}
 	if !s.rl.Allow(claims.TenantID) {
@@ -450,13 +407,9 @@ func (s *Server) handleWaitForEvent(ctx context.Context, req mcpgo.CallToolReque
 
 	outcome := "ok"
 	defer func() {
-		s.audit.Log(audit.Event{
-			TenantID: claims.TenantID,
-			Subject:  claims.Subject,
-			Action:   "session.wait",
-			Resource: sessionID,
-			Outcome:  outcome,
-		})
+		ev := s.newAuditEvent(ctx, "session.wait", outcome)
+		ev.Resource = sessionID
+		s.audit.Log(ev)
 	}()
 
 	deadline := time.Now().Add(time.Duration(timeoutSecs) * time.Second)
@@ -516,12 +469,7 @@ func (s *Server) handleGeneratePayload(ctx context.Context, req mcpgo.CallToolRe
 		return toolError("unauthorized")
 	}
 	if err := auth.RequireScope(claims, "oast:read"); err != nil {
-		s.audit.Log(audit.Event{
-			TenantID: claims.TenantID,
-			Subject:  claims.Subject,
-			Action:   "session.generate_payload",
-			Outcome:  "denied",
-		})
+		s.audit.Log(s.newAuditEvent(ctx, "session.generate_payload", "denied"))
 		return toolError("insufficient scope: oast:read required")
 	}
 	if !s.rl.Allow(claims.TenantID) {
@@ -567,13 +515,9 @@ func (s *Server) handleGeneratePayload(ctx context.Context, req mcpgo.CallToolRe
 		return toolError("unknown payload type: " + payloadType)
 	}
 
-	s.audit.Log(audit.Event{
-		TenantID: claims.TenantID,
-		Subject:  claims.Subject,
-		Action:   "session.generate_payload",
-		Resource: sessionID,
-		Outcome:  "ok",
-	})
+	ev := s.newAuditEvent(ctx, "session.generate_payload", "ok")
+	ev.Resource = sessionID
+	s.audit.Log(ev)
 
 	return toolJSON(map[string]any{
 		"dns_hostname": host,

@@ -24,7 +24,6 @@ import (
 	"strings"
 	"time"
 
-	"github.com/dguerri/oast-mcp/internal/audit"
 	"github.com/dguerri/oast-mcp/internal/auth"
 	"github.com/dguerri/oast-mcp/internal/store"
 	"github.com/google/uuid"
@@ -140,12 +139,7 @@ func (s *Server) handleAgentList(ctx context.Context, req mcpgo.CallToolRequest)
 		return toolError("unauthorized")
 	}
 	if err := auth.RequireScope(claims, "agent:admin"); err != nil {
-		s.audit.Log(audit.Event{
-			TenantID: claims.TenantID,
-			Subject:  claims.Subject,
-			Action:   "agent.list",
-			Outcome:  "denied",
-		})
+		s.audit.Log(s.newAuditEvent(ctx, "agent.list", "denied"))
 		return toolError("insufficient scope: agent:admin required")
 	}
 	if !s.rl.Allow(claims.TenantID) {
@@ -165,12 +159,7 @@ func (s *Server) handleAgentList(ctx context.Context, req mcpgo.CallToolRequest)
 		return toolError("failed to list agents: " + err.Error())
 	}
 
-	s.audit.Log(audit.Event{
-		TenantID: claims.TenantID,
-		Subject:  claims.Subject,
-		Action:   "agent.list",
-		Outcome:  "ok",
-	})
+	s.audit.Log(s.newAuditEvent(ctx, "agent.list", "ok"))
 
 	type agentView struct {
 		AgentID      string   `json:"agent_id"`
@@ -213,12 +202,7 @@ func (s *Server) handleAgentTaskSchedule(ctx context.Context, req mcpgo.CallTool
 		return toolError("unauthorized")
 	}
 	if err := auth.RequireScope(claims, "agent:admin"); err != nil {
-		s.audit.Log(audit.Event{
-			TenantID: claims.TenantID,
-			Subject:  claims.Subject,
-			Action:   "agent.task.schedule",
-			Outcome:  "denied",
-		})
+		s.audit.Log(s.newAuditEvent(ctx, "agent.task.schedule", "denied"))
 		return toolError("insufficient scope: agent:admin required")
 	}
 	if !s.rl.Allow(claims.TenantID) {
@@ -281,13 +265,9 @@ func (s *Server) handleAgentTaskSchedule(ctx context.Context, req mcpgo.CallTool
 		return toolError("failed to schedule task: " + err.Error())
 	}
 
-	s.audit.Log(audit.Event{
-		TenantID: claims.TenantID,
-		Subject:  claims.Subject,
-		Action:   "agent.task.schedule",
-		Resource: taskID,
-		Outcome:  "ok",
-	})
+	ev := s.newAuditEvent(ctx, "agent.task.schedule", "ok")
+	ev.Resource = taskID
+	s.audit.Log(ev)
 
 	return toolJSON(map[string]any{
 		"task_id":      taskID,
@@ -307,12 +287,7 @@ func (s *Server) handleAgentTaskCancel(ctx context.Context, req mcpgo.CallToolRe
 		return toolError("unauthorized")
 	}
 	if err := auth.RequireScope(claims, "agent:admin"); err != nil {
-		s.audit.Log(audit.Event{
-			TenantID: claims.TenantID,
-			Subject:  claims.Subject,
-			Action:   "agent.task.cancel",
-			Outcome:  "denied",
-		})
+		s.audit.Log(s.newAuditEvent(ctx, "agent.task.cancel", "denied"))
 		return toolError("insufficient scope: agent:admin required")
 	}
 	if !s.rl.Allow(claims.TenantID) {
@@ -355,13 +330,9 @@ func (s *Server) handleAgentTaskCancel(ctx context.Context, req mcpgo.CallToolRe
 		}
 	}
 
-	s.audit.Log(audit.Event{
-		TenantID: claims.TenantID,
-		Subject:  claims.Subject,
-		Action:   "agent.task.cancel",
-		Resource: taskID,
-		Outcome:  "ok",
-	})
+	ev := s.newAuditEvent(ctx, "agent.task.cancel", "ok")
+	ev.Resource = taskID
+	s.audit.Log(ev)
 
 	return toolJSON(map[string]any{
 		"task_id":  taskID,
@@ -377,12 +348,7 @@ func (s *Server) handleAgentTaskStatus(ctx context.Context, req mcpgo.CallToolRe
 		return toolError("unauthorized")
 	}
 	if err := auth.RequireScope(claims, "agent:admin"); err != nil {
-		s.audit.Log(audit.Event{
-			TenantID: claims.TenantID,
-			Subject:  claims.Subject,
-			Action:   "agent.task.status",
-			Outcome:  "denied",
-		})
+		s.audit.Log(s.newAuditEvent(ctx, "agent.task.status", "denied"))
 		return toolError("insufficient scope: agent:admin required")
 	}
 	if !s.rl.Allow(claims.TenantID) {
@@ -403,13 +369,9 @@ func (s *Server) handleAgentTaskStatus(ctx context.Context, req mcpgo.CallToolRe
 		return toolError("failed to get task")
 	}
 
-	s.audit.Log(audit.Event{
-		TenantID: claims.TenantID,
-		Subject:  claims.Subject,
-		Action:   "agent.task.status",
-		Resource: taskID,
-		Outcome:  "ok",
-	})
+	ev := s.newAuditEvent(ctx, "agent.task.status", "ok")
+	ev.Resource = taskID
+	s.audit.Log(ev)
 
 	type taskView struct {
 		TaskID      string         `json:"task_id"`
@@ -450,8 +412,7 @@ func (s *Server) handleAgentDropperGenerate(ctx context.Context, req mcpgo.CallT
 		return toolError("unauthorized")
 	}
 	if err := auth.RequireScope(claims, "agent:admin"); err != nil {
-		s.audit.Log(audit.Event{TenantID: claims.TenantID, Subject: claims.Subject,
-			Action: "agent.dropper.generate", Outcome: "denied"})
+		s.audit.Log(s.newAuditEvent(ctx, "agent.dropper.generate", "denied"))
 		return toolError("insufficient scope: agent:admin required")
 	}
 	if !s.rl.Allow(claims.TenantID) {
@@ -490,8 +451,9 @@ func (s *Server) handleAgentDropperGenerate(ctx context.Context, req mcpgo.CallT
 
 	cmds := buildDropperCmds(osArch, downloadURL, loaderB64, launchArgs)
 
-	s.audit.Log(audit.Event{TenantID: claims.TenantID, Subject: claims.Subject,
-		Action: "agent.dropper.generate", Resource: agentID, Outcome: "ok"})
+	ev := s.newAuditEvent(ctx, "agent.dropper.generate", "ok")
+	ev.Resource = agentID
+	s.audit.Log(ev)
 
 	result := map[string]any{
 		"agent_id":   agentID,

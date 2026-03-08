@@ -123,6 +123,45 @@ func ContextWithClaims(ctx context.Context, claims *auth.Claims) context.Context
 	return context.WithValue(ctx, claimsKey{}, claims)
 }
 
+// ContextWithRequestInfo returns a new context with the given client network
+// info injected. This is used in tests to simulate HTTP request metadata.
+func ContextWithRequestInfo(ctx context.Context, remoteAddr, xForwardedFor string) context.Context {
+	return context.WithValue(ctx, requestInfoKey{}, requestInfo{
+		RemoteAddr:    remoteAddr,
+		XForwardedFor: xForwardedFor,
+	})
+}
+
+// requestInfo holds client network info extracted from the HTTP request.
+type requestInfo struct {
+	RemoteAddr    string
+	XForwardedFor string
+}
+
+type requestInfoKey struct{}
+
+func requestInfoFromCtx(ctx context.Context) requestInfo {
+	ri, _ := ctx.Value(requestInfoKey{}).(requestInfo)
+	return ri
+}
+
+// newAuditEvent builds an audit.Event pre-filled with tenant, subject, and
+// client address info from the request context.
+func (s *Server) newAuditEvent(ctx context.Context, action, outcome string) audit.Event {
+	ri := requestInfoFromCtx(ctx)
+	ev := audit.Event{
+		Action:        action,
+		Outcome:       outcome,
+		RemoteAddr:    ri.RemoteAddr,
+		XForwardedFor: ri.XForwardedFor,
+	}
+	if claims, ok := claimsFromCtx(ctx); ok {
+		ev.TenantID = claims.TenantID
+		ev.Subject = claims.Subject
+	}
+	return ev
+}
+
 // Handler returns an http.Handler that validates JWT on every SSE/message request.
 func (s *Server) Handler() http.Handler {
 	sseHandler := mcpserver.NewSSEServer(s.mcp, mcpserver.WithBaseURL(s.mcpBaseURL))
@@ -145,6 +184,10 @@ func (s *Server) Handler() http.Handler {
 			return
 		}
 		ctx := context.WithValue(r.Context(), claimsKey{}, claims)
+		ctx = context.WithValue(ctx, requestInfoKey{}, requestInfo{
+			RemoteAddr:    r.RemoteAddr,
+			XForwardedFor: r.Header.Get("X-Forwarded-For"),
+		})
 		sseHandler.ServeHTTP(w, r.WithContext(ctx))
 	})
 }

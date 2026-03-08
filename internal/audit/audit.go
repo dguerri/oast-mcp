@@ -23,13 +23,15 @@ import (
 
 // Event represents a single auditable action.
 type Event struct {
-	Time     time.Time `json:"time"`
-	TenantID string    `json:"tenant_id,omitempty"`
-	Subject  string    `json:"subject,omitempty"`
-	Action   string    `json:"action"`
-	Resource string    `json:"resource,omitempty"`
-	Outcome  string    `json:"outcome"`
-	Detail   any       `json:"detail,omitempty"`
+	Time          time.Time `json:"time"`
+	TenantID      string    `json:"tenant_id,omitempty"`
+	Subject       string    `json:"subject,omitempty"`
+	Action        string    `json:"action"`
+	Resource      string    `json:"resource,omitempty"`
+	Outcome       string    `json:"outcome"`
+	RemoteAddr    string    `json:"remote_addr,omitempty"`
+	XForwardedFor string    `json:"x_forwarded_for,omitempty"`
+	Detail        any       `json:"detail,omitempty"`
 }
 
 // Logger writes newline-delimited JSON audit events to w.
