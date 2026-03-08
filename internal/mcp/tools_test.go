@@ -42,7 +42,7 @@ func newTestServer(t *testing.T) (*mcpsrv.Server, *auth.Auth, store.Store, *oast
 	a := auth.New(key)
 	st, err := store.NewSQLite(":memory:")
 	require.NoError(t, err)
-	t.Cleanup(func() { st.Close() })
+	t.Cleanup(func() { _ = st.Close() })
 	mock := oast.NewMock(st, "oast.example.com")
 	rl := ratelimit.New(100, 100)
 	al := audit.New(io.Discard)
@@ -59,7 +59,7 @@ func newTestServerWithAuditBuf(t *testing.T) (*mcpsrv.Server, *auth.Auth, store.
 	a := auth.New(key)
 	st, err := store.NewSQLite(":memory:")
 	require.NoError(t, err)
-	t.Cleanup(func() { st.Close() })
+	t.Cleanup(func() { _ = st.Close() })
 	mock := oast.NewMock(st, "oast.example.com")
 	rl := ratelimit.New(100, 100)
 	var buf bytes.Buffer

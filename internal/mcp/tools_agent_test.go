@@ -273,7 +273,7 @@ func newDropperServer(t *testing.T) (*mcpsrv.Server, *auth.Auth) {
 	a := auth.New(keyBytes)
 	st, err := store.NewSQLite(filepath.Join(t.TempDir(), "test.db"))
 	require.NoError(t, err)
-	t.Cleanup(func() { st.Close() })
+	t.Cleanup(func() { _ = st.Close() })
 	mock := oast.NewMock(st, "oast.example.com")
 	rl := ratelimit.New(100, 100)
 	al := audit.New(io.Discard)
