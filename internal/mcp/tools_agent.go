@@ -233,16 +233,9 @@ func (s *Server) handleAgentTaskSchedule(ctx context.Context, req mcpgo.CallTool
 		return toolError("failed to get agent")
 	}
 
-	timeoutSecs := store.DefaultTaskTimeoutSecs
-	if args := req.GetArguments(); args != nil {
-		if v, ok := args["timeout_secs"]; ok {
-			if f, ok := v.(float64); ok && f > 0 {
-				timeoutSecs = int(f)
-				if timeoutSecs > 86400 {
-					return toolError("timeout_secs must not exceed 86400 (24 hours)")
-				}
-			}
-		}
+	timeoutSecs, errMsg := parseTimeoutSecs(req.GetArguments())
+	if errMsg != "" {
+		return toolError(errMsg)
 	}
 
 	taskID := uuid.New().String()
@@ -479,6 +472,27 @@ func (s *Server) handleAgentDropperGenerate(ctx context.Context, req mcpgo.CallT
 		}
 	}
 	return toolJSON(result)
+}
+
+// parseTimeoutSecs extracts and validates timeout_secs from tool arguments.
+// Returns DefaultTaskTimeoutSecs when not set, or a non-empty error string on failure.
+func parseTimeoutSecs(args map[string]any) (int, string) {
+	if args == nil {
+		return store.DefaultTaskTimeoutSecs, ""
+	}
+	v, ok := args["timeout_secs"]
+	if !ok {
+		return store.DefaultTaskTimeoutSecs, ""
+	}
+	f, ok := v.(float64)
+	if !ok || f <= 0 {
+		return store.DefaultTaskTimeoutSecs, ""
+	}
+	secs := int(f)
+	if secs > 86400 {
+		return 0, "timeout_secs must not exceed 86400 (24 hours)"
+	}
+	return secs, ""
 }
 
 // parseDropperParams validates agent dropper parameters and returns the parsed TTL.

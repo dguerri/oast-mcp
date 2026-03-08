@@ -148,38 +148,9 @@ func runOnce() error {
 			continue
 		}
 
-		switch msg.Type {
-		case "error":
-			if msg.Message == "token_expired" {
-				selfDelete()
-				os.Exit(0)
-			}
-			readErr = fmt.Errorf("server error: %s", msg.Message)
+		if fatal := dispatchMessage(msg, results, registry); fatal != nil {
+			readErr = fatal
 			goto done
-
-		case "ping":
-			results <- outMsg{Type: "pong"}
-
-		case "cancel":
-			registry.cancel(msg.TaskID)
-
-		case "task":
-			timeoutSecs := msg.Timeout
-			if timeoutSecs <= 0 {
-				timeoutSecs = store.DefaultTaskTimeoutSecs
-			}
-			ctx, cancelFn := context.WithTimeout(
-				context.Background(),
-				time.Duration(timeoutSecs)*time.Second,
-			)
-			registry.register(msg.TaskID, cancelFn)
-
-			go func(m inMsg, ctx context.Context, cancel context.CancelFunc) {
-				defer cancel()
-				defer registry.remove(m.TaskID)
-				result := handleTask(ctx, m)
-				results <- result
-			}(msg, ctx, cancelFn)
 		}
 	}
 
@@ -190,6 +161,39 @@ done:
 		return writeErr
 	}
 	return readErr
+}
+
+// dispatchMessage processes one inbound WebSocket message. Returns a non-nil
+// error only for fatal conditions that should terminate the read loop.
+func dispatchMessage(msg inMsg, results chan outMsg, registry *taskRegistry) error {
+	switch msg.Type {
+	case "error":
+		if msg.Message == "token_expired" {
+			selfDelete()
+			os.Exit(0)
+		}
+		return fmt.Errorf("server error: %s", msg.Message)
+	case "ping":
+		results <- outMsg{Type: "pong"}
+	case "cancel":
+		registry.cancel(msg.TaskID)
+	case "task":
+		timeoutSecs := msg.Timeout
+		if timeoutSecs <= 0 {
+			timeoutSecs = store.DefaultTaskTimeoutSecs
+		}
+		ctx, cancelFn := context.WithTimeout(
+			context.Background(),
+			time.Duration(timeoutSecs)*time.Second,
+		)
+		registry.register(msg.TaskID, cancelFn)
+		go func(m inMsg, ctx context.Context, cancel context.CancelFunc) {
+			defer cancel()
+			defer registry.remove(m.TaskID)
+			results <- handleTask(ctx, m)
+		}(msg, ctx, cancelFn)
+	}
+	return nil
 }
 
 func handleTask(ctx context.Context, msg inMsg) outMsg {

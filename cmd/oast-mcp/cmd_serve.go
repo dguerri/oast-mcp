@@ -35,6 +35,20 @@ import (
 	"github.com/dguerri/oast-mcp/internal/store"
 )
 
+// restoreOASTSessions reloads the correlation-ID → session mapping from the
+// store so that callbacks for pre-restart sessions are still attributed correctly.
+func restoreOASTSessions(ctx context.Context, st *store.SQLiteStore, ia *oast.Native, logger *slog.Logger) {
+	refs, err := st.RestoreOASTSessions(ctx)
+	if err != nil {
+		logger.Warn("failed to restore oast sessions", "error", err)
+		return
+	}
+	for _, ref := range refs {
+		ia.RestoreSession(ref.CorrelationID, ref.SessionID, ref.TenantID)
+	}
+	logger.Info("restored oast sessions", "count", len(refs))
+}
+
 func cmdServe(args []string) {
 	fs := flag.NewFlagSet("serve", flag.ExitOnError)
 	cfgPath := fs.String("config", "config.yml", "path to config file")
@@ -96,17 +110,7 @@ func cmdServe(args []string) {
 	sigs := make(chan os.Signal, 1)
 	signal.Notify(sigs, syscall.SIGINT, syscall.SIGTERM)
 
-	// Restore OAST corrID -> session map from SQLite so that callbacks for
-	// pre-restart sessions are still attributed correctly.
-	refs, err := st.RestoreOASTSessions(ctx)
-	if err != nil {
-		logger.Warn("failed to restore oast sessions", "error", err)
-	} else {
-		for _, ref := range refs {
-			ia.RestoreSession(ref.CorrelationID, ref.SessionID, ref.TenantID)
-		}
-		logger.Info("restored oast sessions", "count", len(refs))
-	}
+	restoreOASTSessions(ctx, st, ia, logger)
 
 	if err := ia.StartPolling(ctx); err != nil {
 		logger.Error("failed to start oast polling", "error", err)
