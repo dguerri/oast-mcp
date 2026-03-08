@@ -295,6 +295,41 @@ func TestAgentTask_CancelForwarded_E2E(t *testing.T) {
 	}
 }
 
+// TestAgentHeartbeat_UpdatesLastSeen verifies that the server sends periodic
+// pings and that each pong updates last_seen_at in the store.
+func TestAgentHeartbeat_UpdatesLastSeen(t *testing.T) {
+	srv, a, st := setupServer(t)
+
+	token, err := a.IssueAgent("alice", "agent-hb", []string{"agent:connect"}, time.Hour)
+	require.NoError(t, err)
+
+	conn, _ := connectAgent(t, srv, token, "agent-hb", []string{"exec"})
+
+	require.Eventually(t, func() bool {
+		ag, err := st.GetAgent(context.Background(), "agent-hb", "alice")
+		return err == nil && ag != nil
+	}, 2*time.Second, 50*time.Millisecond)
+
+	initialAgent, err := st.GetAgent(context.Background(), "agent-hb", "alice")
+	require.NoError(t, err)
+	initialLastSeen := *initialAgent.LastSeenAt
+
+	// Read the server-initiated ping.
+	require.NoError(t, conn.SetReadDeadline(time.Now().Add(35*time.Second)))
+	var msg map[string]any
+	require.NoError(t, conn.ReadJSON(&msg))
+	assert.Equal(t, "ping", msg["type"])
+
+	// Respond with pong.
+	require.NoError(t, conn.WriteJSON(map[string]any{"type": "pong"}))
+
+	// last_seen_at should advance.
+	require.Eventually(t, func() bool {
+		ag, err := st.GetAgent(context.Background(), "agent-hb", "alice")
+		return err == nil && ag.LastSeenAt != nil && ag.LastSeenAt.After(initialLastSeen)
+	}, 3*time.Second, 50*time.Millisecond, "last_seen_at should be updated after pong")
+}
+
 // TestHandleConn_ExpiredToken verifies that a token that has already expired
 // is rejected with a "token_expired" error message, not the generic "unauthorized".
 func TestHandleConn_ExpiredToken(t *testing.T) {

@@ -37,6 +37,9 @@ import (
 // reaperInterval is how often the server scans for timed-out tasks.
 const reaperInterval = 30 * time.Second
 
+// pingInterval is how often the server sends a heartbeat ping to each agent.
+const pingInterval = 30 * time.Second
+
 var upgrader = websocket.Upgrader{
 	CheckOrigin: func(r *http.Request) bool { return true },
 }
@@ -295,6 +298,7 @@ func (s *Server) handleConn(ctx context.Context, ws *websocket.Conn) {
 
 	go s.dispatchLoop(ctx, conn)
 	go s.writeLoop(ctx, conn)
+	go s.pingLoop(ctx, conn)
 	s.readLoop(ctx, conn)
 }
 
@@ -347,6 +351,24 @@ func (s *Server) writeLoop(ctx context.Context, conn *agentConn) {
 	}
 }
 
+// pingLoop sends periodic pings to the agent. The readLoop updates
+// last_seen_at when the agent responds with a pong.
+func (s *Server) pingLoop(ctx context.Context, conn *agentConn) {
+	ticker := time.NewTicker(pingInterval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			select {
+			case conn.send <- outMsg{Type: "ping"}:
+			default:
+			}
+		}
+	}
+}
+
 // readLoop processes incoming messages from the agent.
 func (s *Server) readLoop(ctx context.Context, conn *agentConn) {
 	for {
@@ -360,6 +382,11 @@ func (s *Server) readLoop(ctx context.Context, conn *agentConn) {
 		switch msg.Type {
 		case "ping":
 			conn.send <- outMsg{Type: "pong"}
+		case "pong":
+			now := time.Now().UTC()
+			if err := s.store.UpdateAgentStatus(ctx, conn.agentID, conn.tenantID, "online", now); err != nil {
+				s.logger.Warn("failed to update last_seen_at", "agent_id", conn.agentID, "err", err)
+			}
 		case "result":
 			s.handleResult(ctx, conn, msg)
 		default:
