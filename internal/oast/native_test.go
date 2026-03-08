@@ -724,7 +724,7 @@ func TestNative_HTTP_SubdomainPrefix_SavesEvent(t *testing.T) {
 
 	resp, err := http.DefaultClient.Do(req)
 	require.NoError(t, err)
-	resp.Body.Close()
+	_ = resp.Body.Close()
 
 	assert.Equal(t, http.StatusOK, resp.StatusCode)
 	require.Eventually(t, func() bool { return sink.Len() == 1 }, time.Second, 10*time.Millisecond)
@@ -806,7 +806,7 @@ func TestNative_HTTP_BodyTruncated(t *testing.T) {
 
 	resp, err := http.DefaultClient.Do(req)
 	require.NoError(t, err)
-	resp.Body.Close()
+	_ = resp.Body.Close()
 
 	require.Eventually(t, func() bool { return sink.Len() == 1 }, time.Second, 10*time.Millisecond)
 
