@@ -108,6 +108,7 @@ type Store interface {
 	GetAgent(ctx context.Context, agentID, tenantID string) (*Agent, error)
 	ListAgents(ctx context.Context, tenantID string) ([]*Agent, error)
 	UpdateAgentStatus(ctx context.Context, agentID, tenantID, status string, lastSeen time.Time) error
+	MarkAllAgentsOffline(ctx context.Context) error
 
 	// Tasks (tenant-scoped)
 	EnqueueTask(ctx context.Context, t *Task) error

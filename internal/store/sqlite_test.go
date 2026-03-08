@@ -449,3 +449,31 @@ func TestTasks_TimeoutFieldsPersisted(t *testing.T) {
 	require.NotNil(t, got.TimeoutAt)
 	assert.WithinDuration(t, timeoutAt, *got.TimeoutAt, time.Second)
 }
+
+// TestMarkAllAgentsOffline verifies that all agents are set to "offline" and
+// last_seen_at is updated.
+func TestMarkAllAgentsOffline(t *testing.T) {
+	s := newStore(t)
+	now := time.Now().UTC()
+
+	require.NoError(t, s.UpsertAgent(ctx, &store.Agent{
+		AgentID: "a1", TenantID: "alice", Name: "A1",
+		RegisteredAt: now, Capabilities: []string{"exec"},
+		Status: "online", LastSeenAt: &now,
+	}))
+	require.NoError(t, s.UpsertAgent(ctx, &store.Agent{
+		AgentID: "a2", TenantID: "bob", Name: "A2",
+		RegisteredAt: now, Capabilities: []string{"exec"},
+		Status: "online", LastSeenAt: &now,
+	}))
+
+	require.NoError(t, s.MarkAllAgentsOffline(ctx))
+
+	a1, err := s.GetAgent(ctx, "a1", "alice")
+	require.NoError(t, err)
+	assert.Equal(t, "offline", a1.Status)
+
+	a2, err := s.GetAgent(ctx, "a2", "bob")
+	require.NoError(t, err)
+	assert.Equal(t, "offline", a2.Status)
+}

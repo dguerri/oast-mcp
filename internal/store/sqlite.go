@@ -508,6 +508,11 @@ func (s *SQLiteStore) UpdateAgentStatus(ctx context.Context, agentID, tenantID, 
 	return err
 }
 
+func (s *SQLiteStore) MarkAllAgentsOffline(ctx context.Context) error {
+	_, err := s.db.ExecContext(ctx, `UPDATE agents SET status = 'offline'`)
+	return err
+}
+
 func scanAgent(row scanner) (*Agent, error) {
 	var (
 		a             Agent

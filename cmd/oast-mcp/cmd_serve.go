@@ -89,6 +89,10 @@ func cmdServe(args []string) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
+	if err := st.MarkAllAgentsOffline(ctx); err != nil {
+		logger.Warn("failed to mark agents offline at startup", "error", err)
+	}
+
 	sigs := make(chan os.Signal, 1)
 	signal.Notify(sigs, syscall.SIGINT, syscall.SIGTERM)
 
