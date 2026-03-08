@@ -22,7 +22,11 @@ import (
 // Returns the private key string (AGE-SECRET-KEY-...) and public key string (age1...).
 // The private key should be stored securely offline by the operator.
 func GenerateKeyPair() (privateKey, publicKey string, err error) {
-	identity, err := age.GenerateX25519Identity()
+	return GenerateKeyPairWith(age.GenerateX25519Identity)
+}
+
+func GenerateKeyPairWith(gen func() (*age.X25519Identity, error)) (string, string, error) {
+	identity, err := gen()
 	if err != nil {
 		return "", "", err
 	}

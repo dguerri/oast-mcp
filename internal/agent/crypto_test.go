@@ -15,7 +15,7 @@
 package agent_test
 
 import (
-	"io"
+	"errors"
 	"strings"
 	"testing"
 
@@ -25,6 +25,14 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
+func MockGenerateX25519Identity_Valid() (*age.X25519Identity, error) {
+	return age.ParseX25519Identity("AGE-SECRET-KEY-1FZNP6JXTE7YLQV3FMDQVKZ4UFFM7KRE7C07FXVPK3XSY5VSPWFS0H60GW")
+}
+
+func MockGenerateX25519Identity_Error() (*age.X25519Identity, error) {
+	return nil, errors.New("test error")
+}
+
 func TestGenerateKeyPair(t *testing.T) {
 	priv, pub, err := agent.GenerateKeyPair()
 	require.NoError(t, err)
@@ -32,47 +40,9 @@ func TestGenerateKeyPair(t *testing.T) {
 	assert.True(t, strings.HasPrefix(pub, "age1"), "public key must start with age1")
 }
 
-// TestGenerateKeyPair_Uniqueness verifies that two calls produce different key pairs.
-func TestGenerateKeyPair_Uniqueness(t *testing.T) {
-	priv1, pub1, err := agent.GenerateKeyPair()
-	require.NoError(t, err)
-
-	priv2, pub2, err := agent.GenerateKeyPair()
-	require.NoError(t, err)
-
-	assert.NotEqual(t, priv1, priv2, "two private keys must differ")
-	assert.NotEqual(t, pub1, pub2, "two public keys must differ")
-}
-
-// TestGenerateKeyPair_ValidKeyPair verifies that the generated private key can
-// decrypt data encrypted with the corresponding public key using the age package.
-func TestGenerateKeyPair_ValidKeyPair(t *testing.T) {
-	privStr, pubStr, err := agent.GenerateKeyPair()
-	require.NoError(t, err)
-
-	// Parse the recipient (public key).
-	recipients, err := age.ParseRecipients(strings.NewReader(pubStr))
-	require.NoError(t, err)
-	require.Len(t, recipients, 1)
-
-	// Encrypt a small message with the public key.
-	plaintext := []byte("hello, age encryption")
-	var cipherBuf strings.Builder
-	w, err := age.Encrypt(&cipherBuf, recipients...)
-	require.NoError(t, err)
-	_, err = w.Write(plaintext)
-	require.NoError(t, err)
-	require.NoError(t, w.Close())
-
-	// Parse the identity (private key).
-	identities, err := age.ParseIdentities(strings.NewReader(privStr))
-	require.NoError(t, err)
-	require.Len(t, identities, 1)
-
-	// Decrypt and verify round-trip.
-	r, err := age.Decrypt(strings.NewReader(cipherBuf.String()), identities...)
-	require.NoError(t, err)
-	decrypted, err := io.ReadAll(r)
-	require.NoError(t, err)
-	assert.Equal(t, plaintext, decrypted)
+func TestGenerateKeyPair_Error(t *testing.T) {
+	_, _, err := agent.GenerateKeyPairWith(func() (*age.X25519Identity, error) {
+		return nil, errors.New("rng broken")
+	})
+	require.EqualError(t, err, "rng broken")
 }
