@@ -7,5 +7,4 @@ linters:
   settings:
     cyclop:
       max-complexity: 15
-      max-package-average-complexity: 8.0
-      skip-tests: true
+      package-average: 8.0
