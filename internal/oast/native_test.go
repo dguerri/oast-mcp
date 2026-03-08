@@ -52,7 +52,7 @@ func freeTCPPort(t *testing.T) int {
 	l, err := net.Listen("tcp", "127.0.0.1:0")
 	require.NoError(t, err)
 	port := l.Addr().(*net.TCPAddr).Port
-	l.Close()
+	_ = l.Close()
 	return port
 }
 
@@ -147,7 +147,7 @@ func TestNative_HTTP_SavesEvent(t *testing.T) {
 
 	resp, err := http.DefaultClient.Do(req)
 	require.NoError(t, err)
-	resp.Body.Close()
+	_ = resp.Body.Close()
 
 	assert.Equal(t, http.StatusOK, resp.StatusCode)
 	require.Eventually(t, func() bool { return sink.Len() == 1 }, time.Second, 10*time.Millisecond)
@@ -776,7 +776,7 @@ func TestNative_RestoreSession_SavesEvent(t *testing.T) {
 
 	hresp, err := http.DefaultClient.Do(req)
 	require.NoError(t, err)
-	hresp.Body.Close()
+	_ = hresp.Body.Close()
 	assert.Equal(t, http.StatusOK, hresp.StatusCode)
 
 	require.Eventually(t, func() bool { return sink.Len() == 2 }, time.Second, 10*time.Millisecond)

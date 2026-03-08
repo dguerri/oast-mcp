@@ -23,7 +23,7 @@ import (
 )
 
 func die(msg string) {
-	os.Stderr.WriteString(msg + "\n")
+	_, _ = os.Stderr.WriteString(msg + "\n")
 	os.Exit(1)
 }
 
@@ -52,7 +52,7 @@ func main() {
 	if err != nil {
 		die("download error: " + err.Error())
 	}
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 
 	if resp.StatusCode != http.StatusOK {
 		die("download failed: HTTP " + http.StatusText(resp.StatusCode))
@@ -65,14 +65,14 @@ func main() {
 	tmpPath := tmp.Name()
 
 	if _, err = io.Copy(tmp, resp.Body); err != nil {
-		tmp.Close()
-		os.Remove(tmpPath)
+		_ = tmp.Close()
+		_ = os.Remove(tmpPath)
 		die("write error: " + err.Error())
 	}
-	tmp.Close()
+	_ = tmp.Close()
 
 	if err = os.Chmod(tmpPath, 0700); err != nil {
-		os.Remove(tmpPath)
+		_ = os.Remove(tmpPath)
 		die("chmod error: " + err.Error())
 	}
 

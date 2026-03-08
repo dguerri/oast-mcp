@@ -73,7 +73,7 @@ func cmdServe(args []string) {
 		logger.Error("failed to open database", "path", cfg.Database.Path, "error", err)
 		os.Exit(1)
 	}
-	defer st.Close()
+	defer func() { _ = st.Close() }()
 
 	a := auth.New(keyBytes)
 

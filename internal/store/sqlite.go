@@ -223,7 +223,7 @@ func (s *SQLiteStore) ListSessions(ctx context.Context, tenantID string) ([]*Ses
 	if err != nil {
 		return nil, err
 	}
-	defer rows.Close()
+	defer func() { _ = rows.Close() }()
 
 	var out []*Session
 	for rows.Next() {
@@ -357,7 +357,7 @@ func (s *SQLiteStore) PollEvents(ctx context.Context, sessionID, tenantID, curso
 	if err != nil {
 		return nil, "", err
 	}
-	defer rows.Close()
+	defer func() { _ = rows.Close() }()
 
 	var events []*Event
 	for rows.Next() {
@@ -493,7 +493,7 @@ func (s *SQLiteStore) ListAgents(ctx context.Context, tenantID string, includeEx
 	if err != nil {
 		return nil, err
 	}
-	defer rows.Close()
+	defer func() { _ = rows.Close() }()
 
 	var out []*Agent
 	for rows.Next() {
@@ -715,7 +715,7 @@ func (s *SQLiteStore) ListTasks(ctx context.Context, agentID, tenantID string) (
 	if err != nil {
 		return nil, err
 	}
-	defer rows.Close()
+	defer func() { _ = rows.Close() }()
 
 	var out []*Task
 	for rows.Next() {
@@ -838,7 +838,7 @@ func (s *SQLiteStore) RestoreOASTSessions(ctx context.Context) ([]SessionRef, er
 	if err != nil {
 		return nil, err
 	}
-	defer rows.Close()
+	defer func() { _ = rows.Close() }()
 
 	var out []SessionRef
 	for rows.Next() {

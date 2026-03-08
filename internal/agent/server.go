@@ -167,7 +167,7 @@ func (s *Server) handleDownload(w http.ResponseWriter, r *http.Request) {
 		}
 		return
 	}
-	defer f.Close()
+	defer func() { _ = f.Close() }()
 
 	w.Header().Set("Content-Type", "application/octet-stream")
 	w.Header().Set("Content-Disposition", fmt.Sprintf(`attachment; filename="%s"`, filename))
@@ -231,7 +231,7 @@ func (s *Server) SendCancel(ctx context.Context, taskID, agentID, tenantID strin
 }
 
 func (s *Server) handleConn(ctx context.Context, ws *websocket.Conn) {
-	defer ws.Close()
+	defer func() { _ = ws.Close() }()
 
 	var reg inMsg
 	if err := ws.SetReadDeadline(time.Now().Add(15 * time.Second)); err != nil {

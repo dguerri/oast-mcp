@@ -61,7 +61,7 @@ func cmdRevoke(args []string) {
 		fmt.Fprintf(os.Stderr, "error opening database %q: %v\n", cfg.Database.Path, err)
 		os.Exit(1)
 	}
-	defer st.Close()
+	defer func() { _ = st.Close() }()
 
 	ctx := context.Background()
 	if err := st.RevokeToken(ctx, claims.JTI, claims.ExpiresAt); err != nil {

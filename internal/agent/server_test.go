@@ -37,7 +37,7 @@ func setupServer(t *testing.T) (*agent.Server, *auth.Auth, store.Store) {
 	a := auth.New(key)
 	st, err := store.NewSQLite(":memory:")
 	require.NoError(t, err)
-	t.Cleanup(func() { st.Close() })
+	t.Cleanup(func() { _ = st.Close() })
 	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
 	srv := agent.NewServer(a, st, logger, t.TempDir())
 	srv.PingInterval = 500 * time.Millisecond
@@ -54,7 +54,7 @@ func connectAgent(t *testing.T, srv *agent.Server, token, agentID string, caps [
 	wsURL := "ws" + strings.TrimPrefix(ts.URL, "http") + "/"
 	conn, _, err := websocket.DefaultDialer.Dial(wsURL, nil)
 	require.NoError(t, err)
-	t.Cleanup(func() { conn.Close() })
+	t.Cleanup(func() { _ = conn.Close() })
 
 	err = conn.WriteJSON(map[string]any{
 		"type":         "register",
@@ -96,7 +96,7 @@ func TestAgentRegister_MissingAgentIDClaim(t *testing.T) {
 	wsURL := "ws" + strings.TrimPrefix(ts.URL, "http") + "/"
 	conn, _, err := websocket.DefaultDialer.Dial(wsURL, nil)
 	require.NoError(t, err)
-	t.Cleanup(func() { conn.Close() })
+	t.Cleanup(func() { _ = conn.Close() })
 
 	require.NoError(t, conn.WriteJSON(map[string]any{
 		"type":     "register",
@@ -410,7 +410,7 @@ func TestHandleConn_ExpiredToken(t *testing.T) {
 	wsURL := "ws" + strings.TrimPrefix(ts.URL, "http") + "/"
 	conn, _, err := websocket.DefaultDialer.Dial(wsURL, nil)
 	require.NoError(t, err)
-	t.Cleanup(func() { conn.Close() })
+	t.Cleanup(func() { _ = conn.Close() })
 
 	require.NoError(t, conn.WriteJSON(map[string]any{
 		"type":     "register",
