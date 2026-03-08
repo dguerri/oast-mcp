@@ -570,3 +570,231 @@ func TestAgentTaskCancel_InsufficientScope(t *testing.T) {
 	require.True(t, result.IsError)
 	assert.Contains(t, getResultText(t, result), "agent:admin")
 }
+
+// TestAgentTaskSchedule_TimeoutExactlyMax verifies that timeout_secs=86400 is
+// accepted as the boundary value (max allowed).
+func TestAgentTaskSchedule_TimeoutExactlyMax(t *testing.T) {
+	srv, a, st, _ := newTestServer(t)
+
+	now := time.Now().UTC()
+	require.NoError(t, st.UpsertAgent(context.Background(), &store.Agent{
+		AgentID:      "agent-max-to",
+		TenantID:     "alice",
+		Name:         "Max Timeout Agent",
+		RegisteredAt: now,
+		Capabilities: []string{"exec"},
+		Status:       "online",
+	}))
+
+	aliceCtx := makeCtx(t, a, "alice", []string{"agent:admin"})
+	result, err := srv.CallTool(aliceCtx, "agent_task_schedule", map[string]any{
+		"agent_id":     "agent-max-to",
+		"capability":   "exec",
+		"params":       map[string]any{"cmd": "id"},
+		"timeout_secs": float64(86400),
+	})
+	require.NoError(t, err)
+	require.False(t, result.IsError, getResultText(t, result))
+
+	var resp map[string]any
+	require.NoError(t, json.Unmarshal([]byte(getResultText(t, result)), &resp))
+	assert.Equal(t, float64(86400), resp["timeout_secs"])
+}
+
+// TestAgentTaskSchedule_TimeoutZero verifies that timeout_secs=0 falls back to
+// the default timeout (treated as "not set" by parseTimeoutSecs).
+func TestAgentTaskSchedule_TimeoutZero(t *testing.T) {
+	srv, a, st, _ := newTestServer(t)
+
+	now := time.Now().UTC()
+	require.NoError(t, st.UpsertAgent(context.Background(), &store.Agent{
+		AgentID:      "agent-zero-to",
+		TenantID:     "alice",
+		Name:         "Zero Timeout Agent",
+		RegisteredAt: now,
+		Capabilities: []string{"exec"},
+		Status:       "online",
+	}))
+
+	aliceCtx := makeCtx(t, a, "alice", []string{"agent:admin"})
+	result, err := srv.CallTool(aliceCtx, "agent_task_schedule", map[string]any{
+		"agent_id":     "agent-zero-to",
+		"capability":   "exec",
+		"params":       map[string]any{"cmd": "id"},
+		"timeout_secs": float64(0),
+	})
+	require.NoError(t, err)
+	require.False(t, result.IsError, getResultText(t, result))
+
+	var resp map[string]any
+	require.NoError(t, json.Unmarshal([]byte(getResultText(t, result)), &resp))
+	// zero is treated as "not set" so the default timeout is used
+	assert.Equal(t, float64(store.DefaultTaskTimeoutSecs), resp["timeout_secs"])
+}
+
+// TestAgentTaskSchedule_MissingAgentID verifies that omitting agent_id returns an error.
+func TestAgentTaskSchedule_MissingAgentID(t *testing.T) {
+	srv, a, _, _ := newTestServer(t)
+	ctx := makeCtx(t, a, "alice", []string{"agent:admin"})
+
+	result, err := srv.CallTool(ctx, "agent_task_schedule", map[string]any{
+		"capability": "exec",
+	})
+	require.NoError(t, err)
+	require.True(t, result.IsError)
+	assert.Contains(t, getResultText(t, result), "agent_id")
+}
+
+// TestAgentDropperGenerate_InvalidTTLFormat verifies that an unparseable TTL
+// string is rejected with a clear error.
+func TestAgentDropperGenerate_InvalidTTLFormat(t *testing.T) {
+	srv, a := newDropperServer(t)
+	ctx := makeCtx(t, a, "alice", []string{"agent:admin"})
+
+	result, err := srv.CallTool(ctx, "agent_dropper_generate", map[string]any{
+		"agent_id": "web-01",
+		"os_arch":  "linux-amd64",
+		"ttl":      "not-a-duration",
+	})
+	require.NoError(t, err)
+	require.True(t, result.IsError)
+	assert.Contains(t, getResultText(t, result), "invalid ttl")
+}
+
+// TestAgentDropperGenerate_ZeroTTL verifies that ttl="0s" is rejected because
+// a non-positive duration is not accepted.
+func TestAgentDropperGenerate_ZeroTTL(t *testing.T) {
+	srv, a := newDropperServer(t)
+	ctx := makeCtx(t, a, "alice", []string{"agent:admin"})
+
+	result, err := srv.CallTool(ctx, "agent_dropper_generate", map[string]any{
+		"agent_id": "web-01",
+		"os_arch":  "linux-amd64",
+		"ttl":      "0s",
+	})
+	require.NoError(t, err)
+	require.True(t, result.IsError)
+	assert.Contains(t, getResultText(t, result), "invalid ttl")
+}
+
+// TestAgentDropperGenerate_ExactlyMaxTTL verifies that ttl="168h" (the maximum)
+// is accepted as a valid boundary value.
+func TestAgentDropperGenerate_ExactlyMaxTTL(t *testing.T) {
+	srv, a := newDropperServer(t)
+	ctx := makeCtx(t, a, "alice", []string{"agent:admin"})
+
+	result, err := srv.CallTool(ctx, "agent_dropper_generate", map[string]any{
+		"agent_id": "web-01",
+		"os_arch":  "linux-amd64",
+		"ttl":      "168h",
+	})
+	require.NoError(t, err)
+	require.False(t, result.IsError, getResultText(t, result))
+
+	var resp map[string]any
+	require.NoError(t, json.Unmarshal([]byte(getResultText(t, result)), &resp))
+	assert.Equal(t, "web-01", resp["agent_id"])
+	assert.NotEmpty(t, resp["token"])
+}
+
+// TestAgentDropperGenerate_MissingParams verifies that omitting the required
+// agent_id parameter returns an error.
+func TestAgentDropperGenerate_MissingParams(t *testing.T) {
+	srv, a := newDropperServer(t)
+	ctx := makeCtx(t, a, "alice", []string{"agent:admin"})
+
+	result, err := srv.CallTool(ctx, "agent_dropper_generate", map[string]any{
+		"os_arch": "linux-amd64",
+		"ttl":     "1h",
+	})
+	require.NoError(t, err)
+	require.True(t, result.IsError)
+	assert.Contains(t, getResultText(t, result), "required")
+}
+
+// TestAgentTaskStatus_PendingTask verifies that a task that was just scheduled
+// (never processed) has status "pending" and no result or error fields.
+func TestAgentTaskStatus_PendingTask(t *testing.T) {
+	srv, a, st, _ := newTestServer(t)
+
+	now := time.Now().UTC()
+	require.NoError(t, st.EnqueueTask(context.Background(), &store.Task{
+		TaskID:     "pending-task-1",
+		AgentID:    "agent-pending",
+		TenantID:   "alice",
+		Capability: "system_info",
+		Status:     "pending",
+		CreatedAt:  now,
+	}))
+
+	aliceCtx := makeCtx(t, a, "alice", []string{"agent:admin"})
+	result, err := srv.CallTool(aliceCtx, "agent_task_status", map[string]any{
+		"task_id": "pending-task-1",
+	})
+	require.NoError(t, err)
+	require.False(t, result.IsError, getResultText(t, result))
+
+	var resp map[string]any
+	require.NoError(t, json.Unmarshal([]byte(getResultText(t, result)), &resp))
+	assert.Equal(t, "pending", resp["status"])
+	assert.Equal(t, "pending-task-1", resp["task_id"])
+	// A pending task must not have a result or error
+	_, hasResult := resp["result"]
+	assert.False(t, hasResult, "pending task should not have a result field")
+	errVal, hasErr := resp["error"]
+	if hasErr {
+		assert.Empty(t, errVal, "pending task should not have an error value")
+	}
+}
+
+// TestAgentList_ShowsCapabilities verifies that the capabilities registered
+// for an agent are included in the agent_list response.
+func TestAgentList_ShowsCapabilities(t *testing.T) {
+	srv, a, st, _ := newTestServer(t)
+
+	now := time.Now().UTC()
+	require.NoError(t, st.UpsertAgent(context.Background(), &store.Agent{
+		AgentID:      "cap-agent",
+		TenantID:     "alice",
+		Name:         "Capable Agent",
+		RegisteredAt: now,
+		Capabilities: []string{"exec", "read_file", "fetch_url", "system_info"},
+		Status:       "online",
+	}))
+
+	aliceCtx := makeCtx(t, a, "alice", []string{"agent:admin"})
+	result, err := srv.CallTool(aliceCtx, "agent_list", nil)
+	require.NoError(t, err)
+	require.False(t, result.IsError, getResultText(t, result))
+
+	items := extractJSONArray(t, result)
+	require.Len(t, items, 1)
+
+	agentMap := items[0].(map[string]any)
+	assert.Equal(t, "cap-agent", agentMap["agent_id"])
+
+	capsRaw, ok := agentMap["capabilities"]
+	require.True(t, ok, "capabilities field must be present")
+	caps, ok := capsRaw.([]any)
+	require.True(t, ok, "capabilities must be a JSON array")
+	capStrs := make([]string, len(caps))
+	for i, c := range caps {
+		capStrs[i] = c.(string)
+	}
+	assert.ElementsMatch(t, []string{"exec", "read_file", "fetch_url", "system_info"}, capStrs)
+}
+
+// TestAgentTaskCancel_NotFound verifies that cancelling a task_id that does
+// not exist returns an error.
+func TestAgentTaskCancel_NotFound(t *testing.T) {
+	srv, a, _, _ := newTestServer(t)
+	ctx := makeCtx(t, a, "alice", []string{"agent:admin"})
+
+	result, err := srv.CallTool(ctx, "agent_task_cancel", map[string]any{
+		"task_id":  "nonexistent-task-id",
+		"agent_id": "some-agent",
+	})
+	require.NoError(t, err)
+	require.True(t, result.IsError)
+	assert.Contains(t, getResultText(t, result), "task not found")
+}

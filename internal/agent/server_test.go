@@ -18,7 +18,10 @@ import (
 	"context"
 	"io"
 	"log/slog"
+	"net/http"
 	"net/http/httptest"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -423,4 +426,133 @@ func TestHandleConn_ExpiredToken(t *testing.T) {
 	require.NoError(t, conn.ReadJSON(&resp))
 	assert.Equal(t, "error", resp["type"])
 	assert.Equal(t, "token_expired", resp["message"])
+}
+
+// TestHealthEndpoints verifies that GET /health and GET /healthz return 200 OK.
+func TestHealthEndpoints(t *testing.T) {
+	srv, _, _ := setupServer(t)
+	ts := httptest.NewServer(srv)
+	t.Cleanup(ts.Close)
+
+	for _, path := range []string{"/health", "/healthz"} {
+		t.Run(path, func(t *testing.T) {
+			resp, err := ts.Client().Get(ts.URL + path)
+			require.NoError(t, err)
+			defer func() { _ = resp.Body.Close() }()
+			assert.Equal(t, http.StatusOK, resp.StatusCode)
+		})
+	}
+}
+
+// TestDownloadLoader_PublicEndpoint verifies that a loader binary can be
+// downloaded without authentication and returns 200 OK.
+func TestDownloadLoader_PublicEndpoint(t *testing.T) {
+	_, _, dir, ts := newHTTPTestServer(t)
+
+	// Create a fake loader binary in the known bin directory.
+	require.NoError(t, os.WriteFile(filepath.Join(dir, "loader-linux-amd64"), []byte("fake-binary"), 0o644))
+
+	resp, err := ts.Client().Get(ts.URL + "/dl/loader-linux-amd64")
+	require.NoError(t, err)
+	defer func() { _ = resp.Body.Close() }()
+	assert.Equal(t, http.StatusOK, resp.StatusCode)
+}
+
+// TestDownloadLoader_NotFound verifies that requesting a non-existent loader binary returns 404.
+func TestDownloadLoader_NotFound(t *testing.T) {
+	dir := t.TempDir()
+	key := make([]byte, 32)
+	a := auth.New(key)
+	st, err := store.NewSQLite(":memory:")
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = st.Close() })
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	srv := agent.NewServer(a, st, logger, dir)
+
+	ts := httptest.NewServer(srv)
+	t.Cleanup(ts.Close)
+
+	resp, err := ts.Client().Get(ts.URL + "/dl/loader-darwin-arm64")
+	require.NoError(t, err)
+	defer func() { _ = resp.Body.Close() }()
+	assert.Equal(t, http.StatusNotFound, resp.StatusCode)
+}
+
+// TestDownloadSecondStage_NoAuth verifies that GET /dl/second-stage/linux/amd64
+// without an Authorization header returns 401.
+func TestDownloadSecondStage_NoAuth(t *testing.T) {
+	dir := t.TempDir()
+	key := make([]byte, 32)
+	a := auth.New(key)
+	st, err := store.NewSQLite(":memory:")
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = st.Close() })
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	srv := agent.NewServer(a, st, logger, dir)
+
+	ts := httptest.NewServer(srv)
+	t.Cleanup(ts.Close)
+
+	resp, err := ts.Client().Get(ts.URL + "/dl/second-stage/linux/amd64")
+	require.NoError(t, err)
+	defer func() { _ = resp.Body.Close() }()
+	assert.Equal(t, http.StatusUnauthorized, resp.StatusCode)
+}
+
+// newHTTPTestServer creates a Server with a known binDir for HTTP-only tests.
+func newHTTPTestServer(t *testing.T) (*agent.Server, *auth.Auth, string, *httptest.Server) {
+	t.Helper()
+	dir := t.TempDir()
+	key := make([]byte, 32)
+	a := auth.New(key)
+	st, err := store.NewSQLite(":memory:")
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = st.Close() })
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	srv := agent.NewServer(a, st, logger, dir)
+	ts := httptest.NewServer(srv)
+	t.Cleanup(ts.Close)
+	return srv, a, dir, ts
+}
+
+// TestDownloadSecondStage_ValidToken_BinaryMissing verifies that a valid
+// agent:connect token + missing binary → 404.
+func TestDownloadSecondStage_ValidToken_BinaryMissing(t *testing.T) {
+	_, a, _, ts := newHTTPTestServer(t)
+
+	token, err := a.IssueAgent("alice", "agent-dl-miss", []string{"agent:connect"}, time.Hour)
+	require.NoError(t, err)
+
+	req, err := http.NewRequest(http.MethodGet, ts.URL+"/dl/second-stage/linux/amd64", nil)
+	require.NoError(t, err)
+	req.Header.Set("Authorization", "Bearer "+token)
+
+	resp, err := ts.Client().Do(req)
+	require.NoError(t, err)
+	defer func() { _ = resp.Body.Close() }()
+	assert.Equal(t, http.StatusNotFound, resp.StatusCode)
+}
+
+// TestDownloadSecondStage_ValidToken_BinaryPresent verifies that a valid
+// agent:connect token + existing binary → 200.
+func TestDownloadSecondStage_ValidToken_BinaryPresent(t *testing.T) {
+	_, a, dir, ts := newHTTPTestServer(t)
+
+	// The server maps /dl/second-stage/linux/amd64 to binDir/agent-linux/amd64.
+	// That path contains a slash (subdirectory), so create the directory first.
+	agentBinPath := filepath.Join(dir, "agent-linux", "amd64")
+	require.NoError(t, os.MkdirAll(filepath.Dir(agentBinPath), 0o755))
+	require.NoError(t, os.WriteFile(agentBinPath, []byte("fake-agent"), 0o644))
+
+	token, err := a.IssueAgent("alice", "agent-dl-ok", []string{"agent:connect"}, time.Hour)
+	require.NoError(t, err)
+
+	req, err := http.NewRequest(http.MethodGet, ts.URL+"/dl/second-stage/linux/amd64", nil)
+	require.NoError(t, err)
+	req.Header.Set("Authorization", "Bearer "+token)
+
+	resp, err := ts.Client().Do(req)
+	require.NoError(t, err)
+	defer func() { _ = resp.Body.Close() }()
+	assert.Equal(t, http.StatusOK, resp.StatusCode)
 }
