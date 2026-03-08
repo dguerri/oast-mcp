@@ -23,12 +23,12 @@ import (
 	"testing"
 	"time"
 
-	"github.com/gorilla/websocket"
-	"github.com/stretchr/testify/assert"
-	"github.com/stretchr/testify/require"
 	"github.com/dguerri/oast-mcp/internal/agent"
 	"github.com/dguerri/oast-mcp/internal/auth"
 	"github.com/dguerri/oast-mcp/internal/store"
+	"github.com/gorilla/websocket"
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 )
 
 func setupServer(t *testing.T) (*agent.Server, *auth.Auth, store.Store) {
@@ -71,7 +71,6 @@ func connectAgent(t *testing.T, srv *agent.Server, token, agentID string, caps [
 func TestAgentRegister_MissingAgentIDClaim(t *testing.T) {
 	srv, a, _ := setupServer(t)
 
-	// Issue a plain operator token — no "aid" claim.
 	token, err := a.Issue("alice", []string{"agent:connect"}, time.Hour)
 	require.NoError(t, err)
 
@@ -106,7 +105,6 @@ func TestAgentRegister_TenantScoped(t *testing.T) {
 
 	connectAgent(t, srv, token, "agent-alice-1", []string{"read_file", "exec"})
 
-	// Give the server goroutine time to process the register message.
 	require.Eventually(t, func() bool {
 		ag, err := st.GetAgent(context.Background(), "agent-alice-1", "alice")
 		return err == nil && ag != nil
@@ -157,13 +155,11 @@ func TestAgentTask_Dispatch_E2E(t *testing.T) {
 
 	conn, _ := connectAgent(t, srv, token, "agent-alice-e2e", []string{"exec"})
 
-	// Wait for registration to complete.
 	require.Eventually(t, func() bool {
 		ag, err := st.GetAgent(context.Background(), "agent-alice-e2e", "alice")
 		return err == nil && ag != nil
 	}, 2*time.Second, 50*time.Millisecond)
 
-	// Enqueue a task.
 	now := time.Now().UTC()
 	task := &store.Task{
 		TaskID:     "task-e2e-1",
@@ -176,7 +172,6 @@ func TestAgentTask_Dispatch_E2E(t *testing.T) {
 	}
 	require.NoError(t, st.EnqueueTask(context.Background(), task))
 
-	// The dispatch loop sends the task within 2 seconds.
 	require.NoError(t, conn.SetReadDeadline(time.Now().Add(5*time.Second)))
 	var taskMsg map[string]any
 	require.NoError(t, conn.ReadJSON(&taskMsg), "agent should receive the task message")
@@ -184,7 +179,6 @@ func TestAgentTask_Dispatch_E2E(t *testing.T) {
 	assert.Equal(t, "task-e2e-1", taskMsg["task_id"])
 	assert.Equal(t, "exec", taskMsg["capability"])
 
-	// Agent sends a result back.
 	require.NoError(t, conn.WriteJSON(map[string]any{
 		"type":    "result",
 		"task_id": "task-e2e-1",
@@ -192,7 +186,6 @@ func TestAgentTask_Dispatch_E2E(t *testing.T) {
 		"data":    map[string]any{"output": "uid=0(root)"},
 	}))
 
-	// Verify the task is marked done in the store.
 	require.Eventually(t, func() bool {
 		t2, err := st.GetTask(context.Background(), "task-e2e-1", "alice")
 		return err == nil && t2.Status == "done"
@@ -214,13 +207,11 @@ func TestAgentTask_TenantIsolation(t *testing.T) {
 
 	aliceConn, _ := connectAgent(t, srv, aliceToken, "agent-alice-iso", []string{"exec"})
 
-	// Wait for alice's agent to register.
 	require.Eventually(t, func() bool {
 		ag, err := st.GetAgent(context.Background(), "agent-alice-iso", "alice")
 		return err == nil && ag != nil
 	}, 2*time.Second, 50*time.Millisecond)
 
-	// Enqueue a task for a different agent (bob's) — alice should not receive it.
 	bobTask := &store.Task{
 		TaskID:     "task-bob-1",
 		AgentID:    "agent-bob-iso",
@@ -232,7 +223,6 @@ func TestAgentTask_TenantIsolation(t *testing.T) {
 	}
 	require.NoError(t, st.EnqueueTask(context.Background(), bobTask))
 
-	// Enqueue a task for alice's agent so the connection stays warm.
 	aliceTask := &store.Task{
 		TaskID:     "task-alice-iso",
 		AgentID:    "agent-alice-iso",
@@ -244,7 +234,6 @@ func TestAgentTask_TenantIsolation(t *testing.T) {
 	}
 	require.NoError(t, st.EnqueueTask(context.Background(), aliceTask))
 
-	// Alice's connection should receive exactly her task, not bob's.
 	require.NoError(t, aliceConn.SetReadDeadline(time.Now().Add(5*time.Second)))
 	var msg map[string]any
 	require.NoError(t, aliceConn.ReadJSON(&msg))
@@ -252,12 +241,65 @@ func TestAgentTask_TenantIsolation(t *testing.T) {
 		"alice's agent must only receive her own tasks")
 }
 
+// TestAgentTask_CancelForwarded_E2E verifies that when SendCancel is called on
+// the server while an agent is connected, a cancel message is forwarded to the
+// agent over WebSocket.
+func TestAgentTask_CancelForwarded_E2E(t *testing.T) {
+	srv, a, st := setupServer(t)
+
+	token, err := a.IssueAgent("alice", "agent-cancel-fwd", []string{"agent:connect"}, time.Hour)
+	require.NoError(t, err)
+
+	conn, _ := connectAgent(t, srv, token, "agent-cancel-fwd", []string{"exec"})
+
+	require.Eventually(t, func() bool {
+		ag, err := st.GetAgent(context.Background(), "agent-cancel-fwd", "alice")
+		return err == nil && ag != nil
+	}, 2*time.Second, 50*time.Millisecond)
+
+	now := time.Now().UTC()
+	timeoutAt := now.Add(10 * time.Minute)
+	task := &store.Task{
+		TaskID:      "task-cancel-fwd",
+		AgentID:     "agent-cancel-fwd",
+		TenantID:    "alice",
+		Capability:  "exec",
+		Params:      map[string]any{"cmd": "sleep 60"},
+		Status:      "pending",
+		CreatedAt:   now,
+		TimeoutSecs: 600,
+		TimeoutAt:   &timeoutAt,
+	}
+	require.NoError(t, st.EnqueueTask(context.Background(), task))
+
+	require.Eventually(t, func() bool {
+		t, err := st.GetTask(context.Background(), "task-cancel-fwd", "alice")
+		return err == nil && t.Status == "running"
+	}, 5*time.Second, 50*time.Millisecond, "task should be claimed as running")
+
+	require.NoError(t, srv.SendCancel(context.Background(), "task-cancel-fwd", "agent-cancel-fwd", "alice"))
+
+	t2, err := st.GetTask(context.Background(), "task-cancel-fwd", "alice")
+	require.NoError(t, err)
+	assert.Equal(t, "error", t2.Status)
+	assert.Equal(t, "cancelled", t2.Err)
+
+	require.NoError(t, conn.SetReadDeadline(time.Now().Add(5*time.Second)))
+	for {
+		var msg map[string]any
+		require.NoError(t, conn.ReadJSON(&msg), "expected cancel message")
+		if msg["type"] == "cancel" {
+			assert.Equal(t, "task-cancel-fwd", msg["task_id"])
+			break
+		}
+	}
+}
+
 // TestHandleConn_ExpiredToken verifies that a token that has already expired
 // is rejected with a "token_expired" error message, not the generic "unauthorized".
 func TestHandleConn_ExpiredToken(t *testing.T) {
 	srv, a, _ := setupServer(t)
 
-	// Issue a token with a negative TTL so it is already expired.
 	token, err := a.IssueAgent("alice", "agent-expired", []string{"agent:connect"}, -time.Second)
 	require.NoError(t, err)
 
@@ -281,4 +323,3 @@ func TestHandleConn_ExpiredToken(t *testing.T) {
 	assert.Equal(t, "error", resp["type"])
 	assert.Equal(t, "token_expired", resp["message"])
 }
-

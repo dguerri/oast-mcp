@@ -46,17 +46,14 @@ func cmdServe(args []string) {
 		os.Exit(1)
 	}
 
-	// --- JWT signing key ---
 	keyBytes, err := hex.DecodeString(cfg.Auth.JWTSigningKeyHex)
 	if err != nil || len(keyBytes) != 32 {
 		fmt.Fprintln(os.Stderr, "error: auth.jwt_signing_key_hex must be exactly 64 hex chars (32 bytes)")
 		os.Exit(1)
 	}
 
-	// --- Logger (structured JSON to stdout) ---
 	logger := slog.New(slog.NewJSONHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelInfo}))
 
-	// --- SQLite store ---
 	st, err := store.NewSQLite(cfg.Database.Path)
 	if err != nil {
 		logger.Error("failed to open database", "path", cfg.Database.Path, "error", err)
@@ -64,10 +61,8 @@ func cmdServe(args []string) {
 	}
 	defer st.Close()
 
-	// --- Auth ---
 	a := auth.New(keyBytes)
 
-	// --- Native DNS+HTTP OAST responder ---
 	ia := oast.NewNative(
 		cfg.Domain.OASTZone,
 		cfg.Responder.PublicIP,
@@ -82,29 +77,23 @@ func cmdServe(args []string) {
 		logger,
 	)
 
-	// --- Rate limiter: 10 req/s burst 30 per tenant ---
 	rl := ratelimit.New(10, 30)
 
-	// --- Audit log (NDJSON to stdout, captured by systemd journal) ---
 	al := audit.New(os.Stdout)
 
-	// --- MCP server ---
 	mcp := mcpsrv.NewServer(a, st, ia, rl, al, logger, cfg.Domain.OASTZone, cfg.Domain.MCPHostname, cfg.Domain.AgentHostname, cfg.Agent.BinDir)
 
-	// --- Agent WebSocket server ---
 	agentSrv := agent.NewServer(a, st, logger, cfg.Agent.BinDir)
+	mcp.SetAgentServer(agentSrv)
 
-	// --- Background context + signal handling ---
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
 	sigs := make(chan os.Signal, 1)
 	signal.Notify(sigs, syscall.SIGINT, syscall.SIGTERM)
 
-	// --- Restore in-memory corrID→session map from durable store ---
-	// Native stores sessions in RAM only; a restart loses the map. Read all
-	// active (non-closed, non-expired) sessions back from SQLite so that
-	// callbacks arriving for pre-restart sessions are still attributed correctly.
+	// Restore OAST corrID -> session map from SQLite so that callbacks for
+	// pre-restart sessions are still attributed correctly.
 	refs, err := st.RestoreOASTSessions(ctx)
 	if err != nil {
 		logger.Warn("failed to restore oast sessions", "error", err)
@@ -115,13 +104,11 @@ func cmdServe(args []string) {
 		logger.Info("restored oast sessions", "count", len(refs))
 	}
 
-	// --- Start OAST polling ---
 	if err := ia.StartPolling(ctx); err != nil {
 		logger.Error("failed to start oast polling", "error", err)
 		os.Exit(1)
 	}
 
-	// --- Start MCP server ---
 	mcpAddr := fmt.Sprintf("%s:%d", cfg.Server.BindAddr, cfg.Server.MCPPort)
 	go func() {
 		logger.Info("starting MCP server", "addr", mcpAddr)
@@ -130,7 +117,6 @@ func cmdServe(args []string) {
 		}
 	}()
 
-	// --- Start agent WebSocket server ---
 	agentAddr := fmt.Sprintf("%s:%d", cfg.Server.BindAddr, cfg.Server.AgentPort)
 	go func() {
 		logger.Info("starting agent server", "addr", agentAddr)
@@ -139,7 +125,6 @@ func cmdServe(args []string) {
 		}
 	}()
 
-	// --- Retention ticker (runs every 24 h) ---
 	sessionTTL := time.Duration(cfg.Retention.SessionTTLDays) * 24 * time.Hour
 	eventTTL := time.Duration(cfg.Retention.EventTTLDays) * 24 * time.Hour
 	go func() {
@@ -162,7 +147,6 @@ func cmdServe(args []string) {
 
 	logger.Info("oast-mcp running", "mcp_addr", mcpAddr, "agent_addr", agentAddr)
 
-	// --- Await shutdown signal ---
 	sig := <-sigs
 	logger.Info("shutting down", "signal", sig.String())
 	cancel()

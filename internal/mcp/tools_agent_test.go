@@ -25,14 +25,14 @@ import (
 	"testing"
 	"time"
 
-	"github.com/stretchr/testify/assert"
-	"github.com/stretchr/testify/require"
-	mcpsrv "github.com/dguerri/oast-mcp/internal/mcp"
 	"github.com/dguerri/oast-mcp/internal/audit"
 	"github.com/dguerri/oast-mcp/internal/auth"
+	mcpsrv "github.com/dguerri/oast-mcp/internal/mcp"
 	"github.com/dguerri/oast-mcp/internal/oast"
 	"github.com/dguerri/oast-mcp/internal/ratelimit"
 	"github.com/dguerri/oast-mcp/internal/store"
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 )
 
 // TestAgentList_Empty verifies that listing agents for a tenant with no agents
@@ -121,7 +121,6 @@ func TestAgentTaskSchedule_Success(t *testing.T) {
 	taskID := extractField(t, result, "task_id")
 	require.NotEmpty(t, taskID)
 
-	// Verify the task was actually stored.
 	task, err := st.GetTask(context.Background(), taskID, "alice")
 	require.NoError(t, err)
 	assert.Equal(t, "pending", task.Status)
@@ -187,7 +186,6 @@ func TestAgentTaskStatus_ReturnsStatusAndResult(t *testing.T) {
 		Result:      map[string]any{"output": "root"},
 	}
 	require.NoError(t, st.EnqueueTask(context.Background(), task))
-	// Update to done state.
 	require.NoError(t, st.UpdateTask(context.Background(), task))
 
 	aliceCtx := makeCtx(t, a, "alice", []string{"agent:admin"})
@@ -227,7 +225,6 @@ func TestAgentTaskStatus_WrongTenant(t *testing.T) {
 	assert.Contains(t, getResultText(t, result), "task not found")
 }
 
-
 // newDropperServer creates an MCP server whose binDir contains a stub loader
 // binary for "linux-amd64". Use this for agent_dropper_generate tests.
 func newDropperServer(t *testing.T) (*mcpsrv.Server, *auth.Auth) {
@@ -243,7 +240,6 @@ func newDropperServer(t *testing.T) (*mcpsrv.Server, *auth.Auth) {
 	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
 
 	binDir := t.TempDir()
-	// Write a stub loader binary so the handler can read it.
 	require.NoError(t, os.WriteFile(filepath.Join(binDir, "loader-linux-amd64"), []byte("stub"), 0600))
 
 	srv := mcpsrv.NewServer(a, st, mock, rl, al, logger, "oast.example.com", "mcp.example.com", "agent.example.com", binDir)
@@ -305,7 +301,6 @@ func TestAgentDropperGenerate_InlineDelivery(t *testing.T) {
 	assert.Nil(t, resp["curl_cmd"])
 	assert.Nil(t, resp["wget_cmd"])
 
-	// b64_cmd must embed the stub bytes (base64-encoded).
 	assert.Contains(t, resp["b64_cmd"], base64.StdEncoding.EncodeToString([]byte("stub")))
 }
 
@@ -356,3 +351,182 @@ func TestAgentDropperGenerate_InsufficientScope(t *testing.T) {
 	assert.Contains(t, getResultText(t, result), "insufficient scope")
 }
 
+// TestAgentTaskSchedule_DefaultTimeout verifies that a scheduled task gets the
+// default timeout when timeout_secs is not supplied.
+func TestAgentTaskSchedule_DefaultTimeout(t *testing.T) {
+	srv, a, st, _ := newTestServer(t)
+
+	now := time.Now().UTC()
+	require.NoError(t, st.UpsertAgent(context.Background(), &store.Agent{
+		AgentID:      "agent-to",
+		TenantID:     "alice",
+		Name:         "Timeout Agent",
+		RegisteredAt: now,
+		Capabilities: []string{"exec"},
+		Status:       "online",
+	}))
+
+	aliceCtx := makeCtx(t, a, "alice", []string{"agent:admin"})
+	result, err := srv.CallTool(aliceCtx, "agent_task_schedule", map[string]any{
+		"agent_id":   "agent-to",
+		"capability": "exec",
+		"params":     map[string]any{"cmd": "id"},
+	})
+	require.NoError(t, err)
+	require.False(t, result.IsError, getResultText(t, result))
+
+	var resp map[string]any
+	require.NoError(t, json.Unmarshal([]byte(getResultText(t, result)), &resp))
+	assert.Equal(t, float64(store.DefaultTaskTimeoutSecs), resp["timeout_secs"])
+	assert.NotEmpty(t, resp["timeout_at"])
+}
+
+// TestAgentTaskSchedule_CustomTimeout verifies that a caller-supplied timeout_secs
+// is stored and returned.
+func TestAgentTaskSchedule_CustomTimeout(t *testing.T) {
+	srv, a, st, _ := newTestServer(t)
+
+	now := time.Now().UTC()
+	require.NoError(t, st.UpsertAgent(context.Background(), &store.Agent{
+		AgentID:      "agent-cto",
+		TenantID:     "alice",
+		Name:         "Custom Timeout Agent",
+		RegisteredAt: now,
+		Capabilities: []string{"exec"},
+		Status:       "online",
+	}))
+
+	aliceCtx := makeCtx(t, a, "alice", []string{"agent:admin"})
+	result, err := srv.CallTool(aliceCtx, "agent_task_schedule", map[string]any{
+		"agent_id":     "agent-cto",
+		"capability":   "exec",
+		"params":       map[string]any{"cmd": "id"},
+		"timeout_secs": float64(120),
+	})
+	require.NoError(t, err)
+	require.False(t, result.IsError, getResultText(t, result))
+
+	var resp map[string]any
+	require.NoError(t, json.Unmarshal([]byte(getResultText(t, result)), &resp))
+	assert.Equal(t, float64(120), resp["timeout_secs"])
+
+	taskID := resp["task_id"].(string)
+	task, err := st.GetTask(context.Background(), taskID, "alice")
+	require.NoError(t, err)
+	assert.Equal(t, 120, task.TimeoutSecs)
+	require.NotNil(t, task.TimeoutAt)
+}
+
+// TestAgentTaskSchedule_TimeoutTooLarge verifies that timeout_secs > 86400 is rejected.
+func TestAgentTaskSchedule_TimeoutTooLarge(t *testing.T) {
+	srv, a, st, _ := newTestServer(t)
+
+	now := time.Now().UTC()
+	require.NoError(t, st.UpsertAgent(context.Background(), &store.Agent{
+		AgentID:      "agent-tl",
+		TenantID:     "alice",
+		Name:         "Agent TL",
+		RegisteredAt: now,
+		Capabilities: []string{"exec"},
+		Status:       "online",
+	}))
+
+	aliceCtx := makeCtx(t, a, "alice", []string{"agent:admin"})
+	result, err := srv.CallTool(aliceCtx, "agent_task_schedule", map[string]any{
+		"agent_id":     "agent-tl",
+		"capability":   "exec",
+		"timeout_secs": float64(90000),
+	})
+	require.NoError(t, err)
+	require.True(t, result.IsError)
+	assert.Contains(t, getResultText(t, result), "86400")
+}
+
+// TestAgentTaskCancel_Pending verifies that a pending task can be cancelled via the MCP tool.
+func TestAgentTaskCancel_Pending(t *testing.T) {
+	srv, a, st, _ := newTestServer(t)
+
+	now := time.Now().UTC()
+	require.NoError(t, st.UpsertAgent(context.Background(), &store.Agent{
+		AgentID: "agent-cancel", TenantID: "alice", Name: "Cancel Agent",
+		RegisteredAt: now, Capabilities: []string{"exec"}, Status: "online",
+	}))
+	require.NoError(t, st.EnqueueTask(context.Background(), &store.Task{
+		TaskID: "cancel-t1", AgentID: "agent-cancel", TenantID: "alice",
+		ScheduledBy: "alice", Capability: "exec",
+		Params: map[string]any{}, Status: "pending", CreatedAt: now,
+	}))
+
+	aliceCtx := makeCtx(t, a, "alice", []string{"agent:admin"})
+	result, err := srv.CallTool(aliceCtx, "agent_task_cancel", map[string]any{
+		"task_id":  "cancel-t1",
+		"agent_id": "agent-cancel",
+	})
+	require.NoError(t, err)
+	require.False(t, result.IsError, getResultText(t, result))
+
+	task, err := st.GetTask(context.Background(), "cancel-t1", "alice")
+	require.NoError(t, err)
+	assert.Equal(t, "error", task.Status)
+	assert.Equal(t, "cancelled", task.Err)
+}
+
+// TestAgentTaskCancel_AlreadyDone verifies that cancelling a terminal task returns an error.
+func TestAgentTaskCancel_AlreadyDone(t *testing.T) {
+	srv, a, st, _ := newTestServer(t)
+
+	now := time.Now().UTC()
+	done := now.Add(time.Second)
+	require.NoError(t, st.EnqueueTask(context.Background(), &store.Task{
+		TaskID: "cancel-t2", AgentID: "agent-cancel", TenantID: "alice",
+		ScheduledBy: "alice", Capability: "exec",
+		Params: map[string]any{}, Status: "pending", CreatedAt: now,
+	}))
+	require.NoError(t, st.UpdateTask(context.Background(), &store.Task{
+		TaskID: "cancel-t2", TenantID: "alice", Status: "done", CompletedAt: &done,
+	}))
+
+	aliceCtx := makeCtx(t, a, "alice", []string{"agent:admin"})
+	result, err := srv.CallTool(aliceCtx, "agent_task_cancel", map[string]any{
+		"task_id":  "cancel-t2",
+		"agent_id": "agent-cancel",
+	})
+	require.NoError(t, err)
+	require.True(t, result.IsError)
+	assert.Contains(t, getResultText(t, result), "terminal")
+}
+
+// TestAgentTaskCancel_WrongTenant verifies that bob cannot cancel alice's task.
+func TestAgentTaskCancel_WrongTenant(t *testing.T) {
+	srv, a, st, _ := newTestServer(t)
+
+	now := time.Now().UTC()
+	require.NoError(t, st.EnqueueTask(context.Background(), &store.Task{
+		TaskID: "cancel-t3", AgentID: "agent-alice", TenantID: "alice",
+		ScheduledBy: "alice", Capability: "exec",
+		Params: map[string]any{}, Status: "pending", CreatedAt: now,
+	}))
+
+	bobCtx := makeCtx(t, a, "bob", []string{"agent:admin"})
+	result, err := srv.CallTool(bobCtx, "agent_task_cancel", map[string]any{
+		"task_id":  "cancel-t3",
+		"agent_id": "agent-alice",
+	})
+	require.NoError(t, err)
+	require.True(t, result.IsError)
+	assert.Contains(t, getResultText(t, result), "task not found")
+}
+
+// TestAgentTaskCancel_InsufficientScope verifies scope enforcement.
+func TestAgentTaskCancel_InsufficientScope(t *testing.T) {
+	srv, a, _, _ := newTestServer(t)
+	ctx := makeCtx(t, a, "alice", []string{"oast:read"})
+
+	result, err := srv.CallTool(ctx, "agent_task_cancel", map[string]any{
+		"task_id":  "some-task",
+		"agent_id": "some-agent",
+	})
+	require.NoError(t, err)
+	require.True(t, result.IsError)
+	assert.Contains(t, getResultText(t, result), "agent:admin")
+}

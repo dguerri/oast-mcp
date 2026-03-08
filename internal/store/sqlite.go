@@ -81,11 +81,14 @@ CREATE TABLE IF NOT EXISTS tasks (
     created_at   TEXT NOT NULL,
     started_at   TEXT,
     completed_at TEXT,
+    timeout_at   TEXT,
+    timeout_secs INTEGER NOT NULL DEFAULT 600,
     result_json  TEXT,
     error        TEXT NOT NULL DEFAULT ''
 );
 CREATE INDEX IF NOT EXISTS idx_task_agent_status ON tasks(agent_id, status, created_at);
 CREATE INDEX IF NOT EXISTS idx_task_tenant ON tasks(tenant_id);
+CREATE INDEX IF NOT EXISTS idx_task_timeout ON tasks(timeout_at) WHERE status IN ('pending','running');
 
 `
 
@@ -104,6 +107,17 @@ func addPragmas(dsn string) string {
 	return dsn + sep + "_pragma=journal_mode(WAL)&_pragma=foreign_keys(ON)"
 }
 
+// migrations contains additive DDL statements applied to existing databases.
+// Each entry uses a plain ALTER TABLE ADD COLUMN (without IF NOT EXISTS, which
+// older SQLite versions do not support). Errors whose message contains
+// "duplicate column name" are silently ignored — they simply mean the column
+// was already added by a previous migration or by the initial schema.
+var migrations = []string{
+	// v2: task timeouts
+	`ALTER TABLE tasks ADD COLUMN timeout_at TEXT`,
+	`ALTER TABLE tasks ADD COLUMN timeout_secs INTEGER NOT NULL DEFAULT 600`,
+}
+
 // NewSQLite opens (or creates) a SQLite database at the given DSN and applies the schema.
 func NewSQLite(dsn string) (*SQLiteStore, error) {
 	db, err := sql.Open("sqlite", addPragmas(dsn))
@@ -116,6 +130,15 @@ func NewSQLite(dsn string) (*SQLiteStore, error) {
 	if _, err := db.Exec(schema); err != nil {
 		_ = db.Close()
 		return nil, fmt.Errorf("apply schema: %w", err)
+	}
+	// Apply additive migrations; ignore "duplicate column name" errors.
+	for _, m := range migrations {
+		if _, err := db.Exec(m); err != nil {
+			if !strings.Contains(err.Error(), "duplicate column name") {
+				_ = db.Close()
+				return nil, fmt.Errorf("migration %q: %w", m, err)
+			}
+		}
 	}
 	return &SQLiteStore{db: db}, nil
 }
@@ -321,7 +344,6 @@ func (s *SQLiteStore) SaveEvent(ctx context.Context, ev *Event) error {
 }
 
 func (s *SQLiteStore) PollEvents(ctx context.Context, sessionID, tenantID, cursor string, limit int) ([]*Event, string, error) {
-	// Verify session belongs to this tenant.
 	var count int
 	err := s.db.QueryRowContext(ctx, `
 		SELECT COUNT(*) FROM sessions
@@ -335,8 +357,8 @@ func (s *SQLiteStore) PollEvents(ctx context.Context, sessionID, tenantID, curso
 		return nil, "", ErrNotFound
 	}
 
-	// cursor format: received_at_rfc3339nano + "_" + event_id
-	// Use string comparison on (received_at || '_' || event_id).
+	// Cursor format: "received_at_rfc3339nano_event_id", enabling
+	// lexicographic ordering via SQLite string comparison.
 	rows, err := s.db.QueryContext(ctx, `
 		SELECT event_id, session_id, tenant_id, received_at, protocol, src_ip, data_json
 		FROM events
@@ -551,11 +573,16 @@ func (s *SQLiteStore) EnqueueTask(ctx context.Context, t *Task) error {
 		}
 		resultJSON = &rj
 	}
+	timeoutSecs := t.TimeoutSecs
+	if timeoutSecs <= 0 {
+		timeoutSecs = DefaultTaskTimeoutSecs
+	}
 	_, err = s.db.ExecContext(ctx, `
 		INSERT INTO tasks
 			(task_id, agent_id, tenant_id, scheduled_by, capability,
-			 params_json, status, created_at, started_at, completed_at, result_json, error)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+			 params_json, status, created_at, started_at, completed_at,
+			 timeout_at, timeout_secs, result_json, error)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 		t.TaskID,
 		t.AgentID,
 		t.TenantID,
@@ -566,6 +593,8 @@ func (s *SQLiteStore) EnqueueTask(ctx context.Context, t *Task) error {
 		timeToStr(t.CreatedAt),
 		nullTimeToStr(t.StartedAt),
 		nullTimeToStr(t.CompletedAt),
+		nullTimeToStr(t.TimeoutAt),
+		timeoutSecs,
 		resultJSON,
 		t.Err,
 	)
@@ -583,7 +612,6 @@ func (s *SQLiteStore) DequeueTask(ctx context.Context, agentID, tenantID string)
 		}
 	}()
 
-	// Find oldest pending task for this agent, scoped to its tenant.
 	var taskID string
 	err = tx.QueryRowContext(ctx, `
 		SELECT task_id FROM tasks
@@ -600,7 +628,6 @@ func (s *SQLiteStore) DequeueTask(ctx context.Context, agentID, tenantID string)
 		return nil, err
 	}
 
-	// Claim it.
 	now := timeToStr(time.Now().UTC())
 	_, err = tx.ExecContext(ctx, `
 		UPDATE tasks SET status = 'running', started_at = ?
@@ -615,11 +642,11 @@ func (s *SQLiteStore) DequeueTask(ctx context.Context, agentID, tenantID string)
 		return nil, err
 	}
 
-	// Re-read the updated task, scoped to both task_id and agent_id so that
-	// no cross-agent (and therefore no cross-tenant) row can be returned.
+	// Scope re-read to agent_id too, preventing cross-tenant leaks.
 	row := s.db.QueryRowContext(ctx, `
 		SELECT task_id, agent_id, tenant_id, scheduled_by, capability,
-		       params_json, status, created_at, started_at, completed_at, result_json, error
+		       params_json, status, created_at, started_at, completed_at,
+		       timeout_at, timeout_secs, result_json, error
 		FROM tasks
 		WHERE task_id = ? AND agent_id = ?`,
 		taskID, agentID,
@@ -663,7 +690,8 @@ func (s *SQLiteStore) UpdateTask(ctx context.Context, t *Task) error {
 func (s *SQLiteStore) GetTask(ctx context.Context, taskID, tenantID string) (*Task, error) {
 	row := s.db.QueryRowContext(ctx, `
 		SELECT task_id, agent_id, tenant_id, scheduled_by, capability,
-		       params_json, status, created_at, started_at, completed_at, result_json, error
+		       params_json, status, created_at, started_at, completed_at,
+		       timeout_at, timeout_secs, result_json, error
 		FROM tasks
 		WHERE task_id = ? AND tenant_id = ?`,
 		taskID, tenantID,
@@ -674,7 +702,8 @@ func (s *SQLiteStore) GetTask(ctx context.Context, taskID, tenantID string) (*Ta
 func (s *SQLiteStore) ListTasks(ctx context.Context, agentID, tenantID string) ([]*Task, error) {
 	rows, err := s.db.QueryContext(ctx, `
 		SELECT task_id, agent_id, tenant_id, scheduled_by, capability,
-		       params_json, status, created_at, started_at, completed_at, result_json, error
+		       params_json, status, created_at, started_at, completed_at,
+		       timeout_at, timeout_secs, result_json, error
 		FROM tasks
 		WHERE agent_id = ? AND tenant_id = ?
 		ORDER BY created_at DESC`,
@@ -702,6 +731,7 @@ func scanTask(row scanner) (*Task, error) {
 		createdAtS   string
 		startedAtS   *string
 		completedAtS *string
+		timeoutAtS   *string
 		paramsJSON   string
 		resultJSON   *string
 	)
@@ -716,6 +746,8 @@ func scanTask(row scanner) (*Task, error) {
 		&createdAtS,
 		&startedAtS,
 		&completedAtS,
+		&timeoutAtS,
+		&t.TimeoutSecs,
 		&resultJSON,
 		&t.Err,
 	)
@@ -734,6 +766,9 @@ func scanTask(row scanner) (*Task, error) {
 	if t.CompletedAt, err = strToNullTime(completedAtS); err != nil {
 		return nil, err
 	}
+	if t.TimeoutAt, err = strToNullTime(timeoutAtS); err != nil {
+		return nil, err
+	}
 	if paramsJSON != "" {
 		if err = unmarshalJSON(paramsJSON, &t.Params); err != nil {
 			return nil, err
@@ -745,6 +780,41 @@ func scanTask(row scanner) (*Task, error) {
 		}
 	}
 	return &t, nil
+}
+
+// CancelTask transitions a pending or running task to error("cancelled").
+// Returns ErrNotFound if the task does not exist for this tenant or is already terminal.
+func (s *SQLiteStore) CancelTask(ctx context.Context, taskID, tenantID string) error {
+	now := timeToStr(time.Now().UTC())
+	res, err := s.db.ExecContext(ctx, `
+		UPDATE tasks
+		SET status = 'error', error = 'cancelled', completed_at = ?
+		WHERE task_id = ? AND tenant_id = ? AND status IN ('pending', 'running')`,
+		now, taskID, tenantID,
+	)
+	if err != nil {
+		return err
+	}
+	return requireAffected(res)
+}
+
+// TimeoutStaleTasks marks all pending/running tasks whose timeout_at has passed
+// as error("task timed out"). Returns the number of rows updated.
+func (s *SQLiteStore) TimeoutStaleTasks(ctx context.Context, now time.Time) (int, error) {
+	nowStr := timeToStr(now)
+	res, err := s.db.ExecContext(ctx, `
+		UPDATE tasks
+		SET status = 'error', error = 'task timed out', completed_at = ?
+		WHERE status IN ('pending', 'running')
+		  AND timeout_at IS NOT NULL
+		  AND timeout_at <= ?`,
+		nowStr, nowStr,
+	)
+	if err != nil {
+		return 0, err
+	}
+	n, err := res.RowsAffected()
+	return int(n), err
 }
 
 // ── OAST session restore ──────────────────────────────────────────────────────

@@ -20,9 +20,9 @@ import (
 	"testing"
 	"time"
 
+	"github.com/dguerri/oast-mcp/internal/store"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
-	"github.com/dguerri/oast-mcp/internal/store"
 )
 
 var ctx = context.Background()
@@ -300,3 +300,152 @@ func TestTasks_TenantIsolation(t *testing.T) {
 	assert.ErrorIs(t, err, store.ErrNotFound)
 }
 
+// TestCancelTask_Pending verifies that cancelling a pending task transitions it
+// to error("cancelled").
+func TestCancelTask_Pending(t *testing.T) {
+	s := newStore(t)
+	now := time.Now().UTC()
+
+	require.NoError(t, s.EnqueueTask(ctx, &store.Task{
+		TaskID: "ct-1", AgentID: "agent-1", TenantID: "alice",
+		ScheduledBy: "alice", Capability: "exec",
+		Params: map[string]any{}, Status: "pending", CreatedAt: now,
+	}))
+
+	require.NoError(t, s.CancelTask(ctx, "ct-1", "alice"))
+
+	got, err := s.GetTask(ctx, "ct-1", "alice")
+	require.NoError(t, err)
+	assert.Equal(t, "error", got.Status)
+	assert.Equal(t, "cancelled", got.Err)
+	assert.NotNil(t, got.CompletedAt)
+}
+
+// TestCancelTask_AlreadyTerminal verifies that cancelling a terminal (done) task
+// returns ErrNotFound (no transition performed).
+func TestCancelTask_AlreadyTerminal(t *testing.T) {
+	s := newStore(t)
+	now := time.Now().UTC()
+
+	require.NoError(t, s.EnqueueTask(ctx, &store.Task{
+		TaskID: "ct-2", AgentID: "agent-1", TenantID: "alice",
+		ScheduledBy: "alice", Capability: "exec",
+		Params: map[string]any{}, Status: "pending", CreatedAt: now,
+	}))
+	done := now.Add(time.Second)
+	require.NoError(t, s.UpdateTask(ctx, &store.Task{
+		TaskID: "ct-2", TenantID: "alice",
+		Status: "done", CompletedAt: &done,
+	}))
+
+	err := s.CancelTask(ctx, "ct-2", "alice")
+	assert.ErrorIs(t, err, store.ErrNotFound, "cancelling a done task must be a no-op")
+}
+
+// TestCancelTask_WrongTenant verifies that cancelling another tenant's task returns ErrNotFound.
+func TestCancelTask_WrongTenant(t *testing.T) {
+	s := newStore(t)
+	now := time.Now().UTC()
+
+	require.NoError(t, s.EnqueueTask(ctx, &store.Task{
+		TaskID: "ct-3", AgentID: "agent-1", TenantID: "alice",
+		ScheduledBy: "alice", Capability: "exec",
+		Params: map[string]any{}, Status: "pending", CreatedAt: now,
+	}))
+
+	err := s.CancelTask(ctx, "ct-3", "bob")
+	assert.ErrorIs(t, err, store.ErrNotFound)
+}
+
+// TestTimeoutStaleTasks verifies that tasks whose timeout_at has passed are marked
+// as error("task timed out") and that tasks with a future timeout_at are unaffected.
+func TestTimeoutStaleTasks(t *testing.T) {
+	s := newStore(t)
+	now := time.Now().UTC()
+
+	pastTimeout := now.Add(-time.Second) // already expired
+	futureTimeout := now.Add(time.Hour)  // not yet expired
+
+	// Task 1: pending, expired timeout → should be timed out.
+	require.NoError(t, s.EnqueueTask(ctx, &store.Task{
+		TaskID: "tst-1", AgentID: "ag", TenantID: "alice",
+		ScheduledBy: "alice", Capability: "exec",
+		Params: map[string]any{}, Status: "pending", CreatedAt: now,
+		TimeoutAt: &pastTimeout, TimeoutSecs: 1,
+	}))
+
+	// Task 2: running, expired timeout → should be timed out.
+	require.NoError(t, s.EnqueueTask(ctx, &store.Task{
+		TaskID: "tst-2", AgentID: "ag", TenantID: "alice",
+		ScheduledBy: "alice", Capability: "exec",
+		Params: map[string]any{}, Status: "pending", CreatedAt: now,
+		TimeoutAt: &pastTimeout, TimeoutSecs: 1,
+	}))
+	started := now
+	require.NoError(t, s.UpdateTask(ctx, &store.Task{
+		TaskID: "tst-2", TenantID: "alice", Status: "running", StartedAt: &started,
+	}))
+
+	// Task 3: pending, future timeout → must NOT be touched.
+	require.NoError(t, s.EnqueueTask(ctx, &store.Task{
+		TaskID: "tst-3", AgentID: "ag", TenantID: "alice",
+		ScheduledBy: "alice", Capability: "exec",
+		Params: map[string]any{}, Status: "pending", CreatedAt: now,
+		TimeoutAt: &futureTimeout, TimeoutSecs: 3600,
+	}))
+
+	// Task 4: done, expired timeout → must NOT be touched (already terminal).
+	require.NoError(t, s.EnqueueTask(ctx, &store.Task{
+		TaskID: "tst-4", AgentID: "ag", TenantID: "alice",
+		ScheduledBy: "alice", Capability: "exec",
+		Params: map[string]any{}, Status: "pending", CreatedAt: now,
+		TimeoutAt: &pastTimeout, TimeoutSecs: 1,
+	}))
+	done := now.Add(time.Millisecond)
+	require.NoError(t, s.UpdateTask(ctx, &store.Task{
+		TaskID: "tst-4", TenantID: "alice", Status: "done", CompletedAt: &done,
+	}))
+
+	n, err := s.TimeoutStaleTasks(ctx, now)
+	require.NoError(t, err)
+	assert.Equal(t, 2, n, "exactly two tasks should have been timed out")
+
+	t1, err := s.GetTask(ctx, "tst-1", "alice")
+	require.NoError(t, err)
+	assert.Equal(t, "error", t1.Status)
+	assert.Equal(t, "task timed out", t1.Err)
+
+	t2, err := s.GetTask(ctx, "tst-2", "alice")
+	require.NoError(t, err)
+	assert.Equal(t, "error", t2.Status)
+	assert.Equal(t, "task timed out", t2.Err)
+
+	t3, err := s.GetTask(ctx, "tst-3", "alice")
+	require.NoError(t, err)
+	assert.Equal(t, "pending", t3.Status, "future-timeout task must remain pending")
+
+	t4, err := s.GetTask(ctx, "tst-4", "alice")
+	require.NoError(t, err)
+	assert.Equal(t, "done", t4.Status, "terminal task must not be touched")
+}
+
+// TestTasks_TimeoutFieldsPersisted verifies that TimeoutAt and TimeoutSecs are
+// stored and retrieved correctly.
+func TestTasks_TimeoutFieldsPersisted(t *testing.T) {
+	s := newStore(t)
+	now := time.Now().UTC().Truncate(time.Second)
+	timeoutAt := now.Add(10 * time.Minute)
+
+	require.NoError(t, s.EnqueueTask(ctx, &store.Task{
+		TaskID: "tf-1", AgentID: "ag", TenantID: "alice",
+		ScheduledBy: "alice", Capability: "exec",
+		Params: map[string]any{}, Status: "pending", CreatedAt: now,
+		TimeoutSecs: 600, TimeoutAt: &timeoutAt,
+	}))
+
+	got, err := s.GetTask(ctx, "tf-1", "alice")
+	require.NoError(t, err)
+	assert.Equal(t, 600, got.TimeoutSecs)
+	require.NotNil(t, got.TimeoutAt)
+	assert.WithinDuration(t, timeoutAt, *got.TimeoutAt, time.Second)
+}

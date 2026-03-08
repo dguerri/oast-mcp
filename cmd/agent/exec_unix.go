@@ -21,12 +21,12 @@ import (
 	"context"
 	"os/exec"
 	"strings"
-	"time"
 )
 
-func runCmd(cmd string, timeoutSecs int) (string, int, error) {
-	ctx, cancel := context.WithTimeout(context.Background(), time.Duration(timeoutSecs)*time.Second)
-	defer cancel()
+// runCmd executes cmd via /bin/sh -c and returns (stdout+stderr, exit code, error).
+// The provided context controls the deadline/cancellation of the subprocess;
+// callers are responsible for setting an appropriate timeout on the context.
+func runCmd(ctx context.Context, cmd string) (string, int, error) {
 	c := exec.CommandContext(ctx, "/bin/sh", "-c", cmd)
 	var buf bytes.Buffer
 	c.Stdout = &buf

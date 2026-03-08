@@ -24,15 +24,15 @@ import (
 	"strings"
 	"time"
 
-	"github.com/google/uuid"
-	mcpgo "github.com/mark3labs/mcp-go/mcp"
-	mcpserver "github.com/mark3labs/mcp-go/server"
 	"github.com/dguerri/oast-mcp/internal/audit"
 	"github.com/dguerri/oast-mcp/internal/auth"
 	"github.com/dguerri/oast-mcp/internal/store"
+	"github.com/google/uuid"
+	mcpgo "github.com/mark3labs/mcp-go/mcp"
+	mcpserver "github.com/mark3labs/mcp-go/server"
 )
 
-// registerAgentTools registers the five agent management tools with the MCP server.
+// registerAgentTools registers all agent management tools with the MCP server.
 func (s *Server) registerAgentTools() {
 	listTool := mcpgo.NewTool("agent_list",
 		mcpgo.WithDescription("List all agents registered for the current tenant. "+
@@ -43,14 +43,18 @@ func (s *Server) registerAgentTools() {
 	scheduleTool := mcpgo.NewTool("agent_task_schedule",
 		mcpgo.WithDescription("Schedule a task for an agent. Tasks are async — poll agent_task_status until status is 'done' or 'error'.\n\n"+
 			"Available capabilities and their params:\n"+
-			"  exec        — run a shell command. params: {\"cmd\": \"<shell command>\", \"timeout\": <seconds, default 30>}\n"+
+			"  exec        — run a shell command. params: {\"cmd\": \"<shell command>\"}\n"+
 			"  read_file   — read a file and return base64-encoded content. params: {\"path\": \"<absolute path>\"}\n"+
-			"  fetch_url   — make an HTTP GET request. params: {\"url\": \"<url>\", \"timeout\": <seconds, default 15>}\n"+
+			"  fetch_url   — make an HTTP GET request. params: {\"url\": \"<url>\"}\n"+
 			"  system_info — return hostname, OS, arch, current user. params: {} (none required)\n\n"+
+			"The timeout_secs parameter controls the overall task deadline (default 600 s = 10 min). "+
+			"The agent enforces this deadline locally, killing any subprocess when it fires. "+
+			"Use agent_task_cancel to abort a pending or running task early.\n\n"+
 			"The returned task_id is used to poll agent_task_status for the result."),
 		mcpgo.WithString("agent_id", mcpgo.Required(), mcpgo.Description("The agent ID to schedule the task for")),
 		mcpgo.WithString("capability", mcpgo.Required(), mcpgo.Description("One of: exec, read_file, fetch_url, system_info")),
 		mcpgo.WithObject("params", mcpgo.Description("Parameters for the capability (see tool description for schema per capability)")),
+		mcpgo.WithNumber("timeout_secs", mcpgo.Description(fmt.Sprintf("Task timeout in seconds (default %d, max 86400)", store.DefaultTaskTimeoutSecs))),
 	)
 
 	statusTool := mcpgo.NewTool("agent_task_status",
@@ -62,9 +66,19 @@ func (s *Server) registerAgentTools() {
 		mcpgo.WithString("task_id", mcpgo.Required(), mcpgo.Description("The task ID to check")),
 	)
 
+	cancelTool := mcpgo.NewTool("agent_task_cancel",
+		mcpgo.WithDescription("Cancel a pending or running agent task. "+
+			"Transitions the task to status 'error' with error 'cancelled'. "+
+			"If the agent is currently connected, a cancel signal is forwarded immediately so the agent can kill the running subprocess. "+
+			"Returns an error if the task does not exist or is already in a terminal state (done/error)."),
+		mcpgo.WithString("task_id", mcpgo.Required(), mcpgo.Description("The task ID to cancel")),
+		mcpgo.WithString("agent_id", mcpgo.Required(), mcpgo.Description("The agent ID that owns the task (needed to route the cancel signal)")),
+	)
+
 	s.mcp.AddTool(listTool, s.handleAgentList)
 	s.mcp.AddTool(scheduleTool, s.handleAgentTaskSchedule)
 	s.mcp.AddTool(statusTool, s.handleAgentTaskStatus)
+	s.mcp.AddTool(cancelTool, s.handleAgentTaskCancel)
 
 	targets := scanLoaderTargets(s.binDir)
 	targetList := strings.Join(targets, ", ")
@@ -112,6 +126,7 @@ func (s *Server) agentHandlers() map[string]mcpserver.ToolHandlerFunc {
 		"agent_list":             s.handleAgentList,
 		"agent_task_schedule":    s.handleAgentTaskSchedule,
 		"agent_task_status":      s.handleAgentTaskStatus,
+		"agent_task_cancel":      s.handleAgentTaskCancel,
 		"agent_dropper_generate": s.handleAgentDropperGenerate,
 	}
 }
@@ -205,7 +220,6 @@ func (s *Server) handleAgentTaskSchedule(ctx context.Context, req mcpgo.CallTool
 		return toolError("capability is required")
 	}
 
-	// Extract optional params object
 	var params map[string]any
 	if args := req.GetArguments(); args != nil {
 		if p, ok := args["params"]; ok {
@@ -213,7 +227,6 @@ func (s *Server) handleAgentTaskSchedule(ctx context.Context, req mcpgo.CallTool
 		}
 	}
 
-	// Verify agent belongs to this tenant
 	if _, err := s.store.GetAgent(ctx, agentID, claims.TenantID); err != nil {
 		if errors.Is(err, store.ErrNotFound) {
 			return toolError("agent not found")
@@ -222,8 +235,21 @@ func (s *Server) handleAgentTaskSchedule(ctx context.Context, req mcpgo.CallTool
 		return toolError("failed to get agent")
 	}
 
+	timeoutSecs := store.DefaultTaskTimeoutSecs
+	if args := req.GetArguments(); args != nil {
+		if v, ok := args["timeout_secs"]; ok {
+			if f, ok := v.(float64); ok && f > 0 {
+				timeoutSecs = int(f)
+				if timeoutSecs > 86400 {
+					return toolError("timeout_secs must not exceed 86400 (24 hours)")
+				}
+			}
+		}
+	}
+
 	taskID := uuid.New().String()
 	now := time.Now().UTC()
+	timeoutAt := now.Add(time.Duration(timeoutSecs) * time.Second)
 	task := &store.Task{
 		TaskID:      taskID,
 		AgentID:     agentID,
@@ -233,6 +259,8 @@ func (s *Server) handleAgentTaskSchedule(ctx context.Context, req mcpgo.CallTool
 		Params:      params,
 		Status:      "pending",
 		CreatedAt:   now,
+		TimeoutSecs: timeoutSecs,
+		TimeoutAt:   &timeoutAt,
 	}
 	if err := s.store.EnqueueTask(ctx, task); err != nil {
 		s.logger.Error("failed to enqueue task", "error", err)
@@ -248,11 +276,83 @@ func (s *Server) handleAgentTaskSchedule(ctx context.Context, req mcpgo.CallTool
 	})
 
 	return toolJSON(map[string]any{
-		"task_id":    taskID,
-		"agent_id":   agentID,
-		"capability": capability,
-		"status":     "pending",
-		"created_at": now.Format(time.RFC3339),
+		"task_id":      taskID,
+		"agent_id":     agentID,
+		"capability":   capability,
+		"status":       "pending",
+		"timeout_secs": timeoutSecs,
+		"timeout_at":   timeoutAt.Format(time.RFC3339),
+		"created_at":   now.Format(time.RFC3339),
+	})
+}
+
+// handleAgentTaskCancel handles the agent_task_cancel tool call.
+func (s *Server) handleAgentTaskCancel(ctx context.Context, req mcpgo.CallToolRequest) (*mcpgo.CallToolResult, error) {
+	claims, ok := claimsFromCtx(ctx)
+	if !ok {
+		return toolError("unauthorized")
+	}
+	if err := auth.RequireScope(claims, "agent:admin"); err != nil {
+		s.audit.Log(audit.Event{
+			TenantID: claims.TenantID,
+			Subject:  claims.Subject,
+			Action:   "agent.task.cancel",
+			Outcome:  "denied",
+		})
+		return toolError("insufficient scope: agent:admin required")
+	}
+	if !s.rl.Allow(claims.TenantID) {
+		return toolError("rate limit exceeded")
+	}
+
+	taskID := req.GetString("task_id", "")
+	if taskID == "" {
+		return toolError("task_id is required")
+	}
+	agentID := req.GetString("agent_id", "")
+	if agentID == "" {
+		return toolError("agent_id is required")
+	}
+
+	if _, err := s.store.GetTask(ctx, taskID, claims.TenantID); err != nil {
+		if errors.Is(err, store.ErrNotFound) {
+			return toolError("task not found")
+		}
+		s.logger.Error("failed to get task for cancel", "error", err)
+		return toolError("failed to get task")
+	}
+
+	// Fall back to store-only cancel when no agent server is configured.
+	if s.agentSrv != nil {
+		if err := s.agentSrv.SendCancel(ctx, taskID, agentID, claims.TenantID); err != nil {
+			if errors.Is(err, store.ErrNotFound) {
+				return toolError("task is already in a terminal state")
+			}
+			s.logger.Error("failed to cancel task", "error", err)
+			return toolError("failed to cancel task")
+		}
+	} else {
+		if err := s.store.CancelTask(ctx, taskID, claims.TenantID); err != nil {
+			if errors.Is(err, store.ErrNotFound) {
+				return toolError("task is already in a terminal state")
+			}
+			s.logger.Error("failed to cancel task", "error", err)
+			return toolError("failed to cancel task")
+		}
+	}
+
+	s.audit.Log(audit.Event{
+		TenantID: claims.TenantID,
+		Subject:  claims.Subject,
+		Action:   "agent.task.cancel",
+		Resource: taskID,
+		Outcome:  "ok",
+	})
+
+	return toolJSON(map[string]any{
+		"task_id":  taskID,
+		"agent_id": agentID,
+		"status":   "cancelled",
 	})
 }
 
@@ -361,9 +461,8 @@ func (s *Server) handleAgentDropperGenerate(ctx context.Context, req mcpgo.CallT
 			" (run 'make build-loaders' on the server)")
 	}
 
-	// Mint agent token with both tenantID and agentID baked in.
-	// The agent server uses these JWT claims as the sole source of identity —
-	// the client-supplied agent_id in the register message is ignored.
+	// The JWT embeds both tenantID and agentID; the agent server treats
+	// these claims as the sole source of identity.
 	token, err := s.auth.IssueAgent(claims.TenantID, agentID, []string{"agent:connect"}, ttl)
 	if err != nil {
 		s.logger.Error("failed to mint agent token", "err", err)
@@ -373,7 +472,6 @@ func (s *Server) handleAgentDropperGenerate(ctx context.Context, req mcpgo.CallT
 	expiresAt := time.Now().Add(ttl).UTC()
 	loaderB64 := base64.StdEncoding.EncodeToString(loaderBytes)
 	downloadURL := s.agentBaseURL + "/dl/" + loaderName
-	// Positional args: loader <url> <token> <agent_id>
 	launchArgs := fmt.Sprintf("%s %s %s", s.agentBaseURL, token, agentID)
 
 	cmds := buildDropperCmds(osArch, downloadURL, loaderB64, launchArgs)
@@ -472,4 +570,3 @@ func buildDropperCmds(osArch, downloadURL, loaderB64, launchArgs string) dropper
 			loaderB64, launchArgs),
 	}
 }
-

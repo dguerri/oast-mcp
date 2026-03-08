@@ -17,6 +17,7 @@
 package main
 
 import (
+	"context"
 	"crypto/tls"
 	"encoding/base64"
 	"encoding/json"
@@ -27,10 +28,12 @@ import (
 	"net/url"
 	"os"
 	"runtime"
+	"sync"
 	"time"
 
-	"github.com/gorilla/websocket"
 	"github.com/dguerri/oast-mcp/internal/agent"
+	"github.com/dguerri/oast-mcp/internal/store"
+	"github.com/gorilla/websocket"
 )
 
 var (
@@ -44,6 +47,7 @@ type inMsg struct {
 	TaskID     string         `json:"task_id,omitempty"`
 	Capability string         `json:"capability,omitempty"`
 	Params     map[string]any `json:"params,omitempty"`
+	Timeout    int            `json:"timeout,omitempty"` // seconds; 0 means use capability default
 	Message    string         `json:"message,omitempty"`
 }
 
@@ -53,6 +57,37 @@ type outMsg struct {
 	Ok     bool           `json:"ok,omitempty"`
 	Data   map[string]any `json:"data,omitempty"`
 	Error  string         `json:"error,omitempty"`
+}
+
+// taskRegistry tracks cancel functions for running tasks so that a cancel
+// message from the server can abort the corresponding subprocess.
+type taskRegistry struct {
+	mu      sync.Mutex
+	cancels map[string]context.CancelFunc
+}
+
+func newTaskRegistry() *taskRegistry {
+	return &taskRegistry{cancels: make(map[string]context.CancelFunc)}
+}
+
+func (r *taskRegistry) register(taskID string, cancel context.CancelFunc) {
+	r.mu.Lock()
+	r.cancels[taskID] = cancel
+	r.mu.Unlock()
+}
+
+func (r *taskRegistry) cancel(taskID string) {
+	r.mu.Lock()
+	if fn, ok := r.cancels[taskID]; ok {
+		fn()
+	}
+	r.mu.Unlock()
+}
+
+func (r *taskRegistry) remove(taskID string) {
+	r.mu.Lock()
+	delete(r.cancels, taskID)
+	r.mu.Unlock()
 }
 
 func wsURL(base string) string {
@@ -78,13 +113,33 @@ func runOnce() error {
 		return err
 	}
 
+	registry := newTaskRegistry()
+	results := make(chan outMsg, 32)
+
+	// Serialise all writes to the WebSocket connection via a single goroutine.
+	var writeErr error
+	var writeDone = make(chan struct{})
+	go func() {
+		defer close(writeDone)
+		for msg := range results {
+			b, _ := json.Marshal(msg)
+			if err := conn.WriteMessage(websocket.TextMessage, b); err != nil {
+				writeErr = err
+				return
+			}
+		}
+	}()
+
+	var readErr error
 	for {
 		if err := conn.SetReadDeadline(time.Now().Add(35 * time.Second)); err != nil {
-			return err
+			readErr = err
+			break
 		}
 		_, raw, err := conn.ReadMessage()
 		if err != nil {
-			return err
+			readErr = err
+			break
 		}
 
 		var msg inMsg
@@ -98,22 +153,45 @@ func runOnce() error {
 				selfDelete()
 				os.Exit(0)
 			}
-			return fmt.Errorf("server error: %s", msg.Message)
+			readErr = fmt.Errorf("server error: %s", msg.Message)
+			goto done
+
 		case "ping":
-			if err := conn.WriteMessage(websocket.TextMessage, []byte(`{"type":"pong"}`)); err != nil {
-				return err
-			}
+			results <- outMsg{Type: "pong"}
+
+		case "cancel":
+			registry.cancel(msg.TaskID)
+
 		case "task":
-			result := handleTask(msg)
-			b, _ := json.Marshal(result)
-			if err := conn.WriteMessage(websocket.TextMessage, b); err != nil {
-				return err
+			timeoutSecs := msg.Timeout
+			if timeoutSecs <= 0 {
+				timeoutSecs = store.DefaultTaskTimeoutSecs
 			}
+			ctx, cancelFn := context.WithTimeout(
+				context.Background(),
+				time.Duration(timeoutSecs)*time.Second,
+			)
+			registry.register(msg.TaskID, cancelFn)
+
+			go func(m inMsg, ctx context.Context, cancel context.CancelFunc) {
+				defer cancel()
+				defer registry.remove(m.TaskID)
+				result := handleTask(ctx, m)
+				results <- result
+			}(msg, ctx, cancelFn)
 		}
 	}
+
+done:
+	close(results)
+	<-writeDone
+	if writeErr != nil {
+		return writeErr
+	}
+	return readErr
 }
 
-func handleTask(msg inMsg) outMsg {
+func handleTask(ctx context.Context, msg inMsg) outMsg {
 	tid := msg.TaskID
 	params := msg.Params
 	if params == nil {
@@ -126,11 +204,7 @@ func handleTask(msg inMsg) outMsg {
 	switch msg.Capability {
 	case agent.CapExec:
 		cmd, _ := params["cmd"].(string)
-		timeout := 30
-		if t, ok := params["timeout"].(float64); ok {
-			timeout = int(t)
-		}
-		out, code, err := runCmd(cmd, timeout)
+		out, code, err := runCmd(ctx, cmd)
 		if err != nil {
 			execErr = err.Error()
 		} else {
@@ -148,12 +222,13 @@ func handleTask(msg inMsg) outMsg {
 
 	case agent.CapFetchURL:
 		rawURL, _ := params["url"].(string)
-		timeout := 15
-		if t, ok := params["timeout"].(float64); ok {
-			timeout = int(t)
+		client := &http.Client{}
+		req, err := http.NewRequestWithContext(ctx, http.MethodGet, rawURL, nil)
+		if err != nil {
+			execErr = err.Error()
+			break
 		}
-		client := &http.Client{Timeout: time.Duration(timeout) * time.Second}
-		resp, err := client.Get(rawURL)
+		resp, err := client.Do(req)
 		if err != nil {
 			execErr = err.Error()
 		} else {
@@ -209,9 +284,7 @@ func main() {
 
 	backoff := time.Second
 	for {
-		if err := runOnce(); err != nil {
-			_ = err // logged implicitly; runOnce returns nil on clean exit
-		}
+		_ = runOnce()
 		time.Sleep(backoff)
 		if backoff < 60*time.Second {
 			backoff *= 2

@@ -29,10 +29,13 @@ import (
 	"sync"
 	"time"
 
-	"github.com/gorilla/websocket"
 	"github.com/dguerri/oast-mcp/internal/auth"
 	"github.com/dguerri/oast-mcp/internal/store"
+	"github.com/gorilla/websocket"
 )
+
+// reaperInterval is how often the server scans for timed-out tasks.
+const reaperInterval = 30 * time.Second
 
 var upgrader = websocket.Upgrader{
 	CheckOrigin: func(r *http.Request) bool { return true },
@@ -55,6 +58,7 @@ type outMsg struct {
 	TaskID     string         `json:"task_id,omitempty"`
 	Capability string         `json:"capability,omitempty"`
 	Params     map[string]any `json:"params,omitempty"`
+	Timeout    int            `json:"timeout,omitempty"` // seconds; 0 means use agent default
 	Message    string         `json:"message,omitempty"`
 }
 
@@ -101,13 +105,10 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 	ws, err := upgrader.Upgrade(w, r, nil)
 	if err != nil {
-		// Non-WebSocket clients (health probes, scanners) hit this path.
-		// Treat as a client error (WARN), not a server error.
 		s.logger.Warn("ws upgrade", "remote_addr", r.RemoteAddr, "user_agent", r.UserAgent(), "err", err)
 		return
 	}
-	// Use Background context: r.Context() is cancelled when ServeHTTP returns,
-	// but the WebSocket connection outlives the HTTP request.
+	// WebSocket connections outlive the HTTP request, so use Background.
 	go s.handleConn(context.Background(), ws)
 }
 
@@ -173,13 +174,59 @@ func (s *Server) ListenAndServe(addr string) error {
 		return fmt.Errorf("listen %s: %w", addr, err)
 	}
 	s.logger.Info("agent server listening", "addr", ln.Addr())
+
+	go s.reaperLoop(context.Background())
+
 	return http.Serve(ln, s)
+}
+
+// reaperLoop periodically marks timed-out tasks as error and notifies connected agents.
+func (s *Server) reaperLoop(ctx context.Context) {
+	ticker := time.NewTicker(reaperInterval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			n, err := s.store.TimeoutStaleTasks(ctx, time.Now().UTC())
+			if err != nil {
+				s.logger.Warn("timeout stale tasks", "err", err)
+				continue
+			}
+			if n > 0 {
+				s.logger.Info("timed out stale tasks", "count", n)
+			}
+		}
+	}
+}
+
+// SendCancel marks a task as cancelled in the store and, if the owning agent
+// is currently connected, forwards a cancel message to it over WebSocket.
+// Returns ErrNotFound (wrapped) if the task is not in a cancellable state.
+func (s *Server) SendCancel(ctx context.Context, taskID, agentID, tenantID string) error {
+	if err := s.store.CancelTask(ctx, taskID, tenantID); err != nil {
+		return err
+	}
+	// Best-effort: forward cancel to connected agent if online.
+	s.mu.RLock()
+	conn, ok := s.conns[connKey(tenantID, agentID)]
+	s.mu.RUnlock()
+	if ok {
+		// Non-blocking send; drop if buffer is full.
+		select {
+		case conn.send <- outMsg{Type: "cancel", TaskID: taskID}:
+		default:
+			s.logger.Warn("cancel message dropped: send buffer full",
+				"agentID", agentID, "taskID", taskID)
+		}
+	}
+	return nil
 }
 
 func (s *Server) handleConn(ctx context.Context, ws *websocket.Conn) {
 	defer ws.Close()
 
-	// First message must be "register"
 	var reg inMsg
 	if err := ws.SetReadDeadline(time.Now().Add(15 * time.Second)); err != nil {
 		return
@@ -206,9 +253,7 @@ func (s *Server) handleConn(ctx context.Context, ws *websocket.Conn) {
 		return
 	}
 
-	// The agent_id is baked into the JWT by IssueAgent — we never trust the
-	// client-supplied reg.AgentID. This prevents a rogue client from claiming
-	// any agent_id it likes (including one belonging to another tenant).
+	// Trust only the JWT-embedded agent_id, never the client-supplied value.
 	agentID := claims.AgentID
 	if agentID == "" {
 		_ = ws.WriteJSON(outMsg{Type: "error", Message: "token missing agent_id claim"})
@@ -245,7 +290,6 @@ func (s *Server) handleConn(ctx context.Context, ws *websocket.Conn) {
 		}
 	}()
 
-	// Start task dispatcher and writer goroutines
 	ctx, cancel := context.WithCancel(ctx)
 	defer cancel()
 
@@ -267,11 +311,22 @@ func (s *Server) dispatchLoop(ctx context.Context, conn *agentConn) {
 			if err != nil || task == nil {
 				continue
 			}
+			// Send remaining seconds so the agent can enforce the deadline locally.
+			timeoutSecs := task.TimeoutSecs
+			if task.TimeoutAt != nil {
+				remaining := int(time.Until(*task.TimeoutAt).Seconds())
+				if remaining <= 0 {
+					// Already expired — let the reaper handle it, skip dispatch.
+					continue
+				}
+				timeoutSecs = remaining
+			}
 			conn.send <- outMsg{
 				Type:       "task",
 				TaskID:     task.TaskID,
 				Capability: task.Capability,
 				Params:     task.Params,
+				Timeout:    timeoutSecs,
 			}
 		}
 	}
@@ -332,4 +387,3 @@ func (s *Server) handleResult(ctx context.Context, conn *agentConn, msg inMsg) {
 		s.logger.Error("update task", "taskID", msg.TaskID, "err", err)
 	}
 }
-

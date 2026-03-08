@@ -26,13 +26,14 @@ import (
 	"strings"
 	"time"
 
-	mcpgo "github.com/mark3labs/mcp-go/mcp"
-	mcpserver "github.com/mark3labs/mcp-go/server"
+	"github.com/dguerri/oast-mcp/internal/agent"
 	"github.com/dguerri/oast-mcp/internal/audit"
 	"github.com/dguerri/oast-mcp/internal/auth"
 	"github.com/dguerri/oast-mcp/internal/oast"
 	"github.com/dguerri/oast-mcp/internal/ratelimit"
 	"github.com/dguerri/oast-mcp/internal/store"
+	mcpgo "github.com/mark3labs/mcp-go/mcp"
+	mcpserver "github.com/mark3labs/mcp-go/server"
 )
 
 // Server is the MCP server for OAST tools.
@@ -48,6 +49,7 @@ type Server struct {
 	mcpBaseURL   string // e.g., "https://mcp.example.com"
 	agentBaseURL string // e.g., "https://agent.example.com"
 	binDir       string // path to pre-built loader/agent binaries
+	agentSrv     *agent.Server
 }
 
 // NewServer creates a new MCP server with the given dependencies.
@@ -79,6 +81,13 @@ func NewServer(
 	s.registerTools()
 	s.registerAgentTools()
 	return s
+}
+
+// SetAgentServer injects the agent WebSocket server so that agent MCP tools can
+// forward cancel messages to connected agents. Call this after construction, before
+// serving requests.
+func (s *Server) SetAgentServer(srv *agent.Server) {
+	s.agentSrv = srv
 }
 
 // scanLoaderTargets returns available os-arch targets by scanning binDir for loader-* files.

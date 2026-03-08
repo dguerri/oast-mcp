@@ -25,6 +25,10 @@ import (
 // ErrNotFound is returned by store methods when the requested record does not exist.
 var ErrNotFound = errors.New("not found")
 
+// DefaultTaskTimeoutSecs is the fallback task timeout (10 minutes) used when
+// the caller does not specify a timeout.
+const DefaultTaskTimeoutSecs = 600
+
 // SessionRef carries the minimal session fields needed to rebuild the OAST
 // in-memory corrID→session map after a restart. It contains no tenant-secret
 // data beyond what is already recorded against the corrID in DNS/HTTP logs.
@@ -76,6 +80,8 @@ type Task struct {
 	CreatedAt   time.Time
 	StartedAt   *time.Time
 	CompletedAt *time.Time
+	TimeoutAt   *time.Time
+	TimeoutSecs int // 0 means use default
 	Result      map[string]any
 	Err         string
 }
@@ -109,6 +115,12 @@ type Store interface {
 	UpdateTask(ctx context.Context, t *Task) error
 	GetTask(ctx context.Context, taskID, tenantID string) (*Task, error)
 	ListTasks(ctx context.Context, agentID, tenantID string) ([]*Task, error)
+	// CancelTask transitions a pending or running task to error("cancelled").
+	// Returns ErrNotFound if the task does not exist or is already terminal.
+	CancelTask(ctx context.Context, taskID, tenantID string) error
+	// TimeoutStaleTasks marks all pending/running tasks whose timeout_at has
+	// passed as error("task timed out"). Returns the number of tasks updated.
+	TimeoutStaleTasks(ctx context.Context, now time.Time) (int, error)
 
 	// Maintenance
 	PurgeExpired(ctx context.Context, sessionTTL, eventTTL time.Duration) error
