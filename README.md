@@ -1,5 +1,10 @@
 # oast-mcp
 
+[![CI](https://github.com/dguerri/oast-mcp/actions/workflows/ci.yml/badge.svg)](https://github.com/dguerri/oast-mcp/actions/workflows/ci.yml)
+[![Coverage](https://codecov.io/gh/dguerri/oast-mcp/branch/main/graph/badge.svg)](https://codecov.io/gh/dguerri/oast-mcp)
+[![Go version](https://img.shields.io/badge/go-1.25-00ADD8?logo=go)](https://go.dev/dl/)
+[![License](https://img.shields.io/badge/license-Apache%202.0-blue.svg)](LICENSE)
+
 **Out-of-Band Application Security Testing via the Model Context Protocol.**
 
 oast-mcp exposes six OAST tools and six agent-management tools to any MCP-compatible AI assistant. It lets an AI drive DNS/HTTP/HTTPS callback detection, deploy agents on compromised targets, and run remote tasks — all from a single, audited interface.
