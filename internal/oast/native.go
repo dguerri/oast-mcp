@@ -179,6 +179,35 @@ func (n *Native) Stop() {
 	}
 }
 
+func (n *Native) tsigSecrets() map[string]string {
+	m := map[string]string{}
+	if n.tsigKeyName != "" && n.tsigKeyB64 != "" {
+		m[n.tsigKeyName] = n.tsigKeyB64
+	}
+	return m
+}
+
+// bindDNS pre-binds UDP and TCP sockets for the DNS server. The UDP socket is
+// bound first so we know the actual port (important when dnsPort is 0) before
+// binding TCP to the same port. This eliminates the TOCTOU race that caused
+// sporadic "address already in use" failures in parallel tests.
+func (n *Native) bindDNS() (net.PacketConn, net.Listener, error) {
+	udpAddr := fmt.Sprintf("%s:%d", n.dnsBindAddr, n.dnsPort)
+	udpConn, err := net.ListenPacket("udp", udpAddr)
+	if err != nil {
+		return nil, nil, fmt.Errorf("bind dns udp %s: %w", udpAddr, err)
+	}
+	n.dnsPort = udpConn.LocalAddr().(*net.UDPAddr).Port
+
+	tcpAddr := fmt.Sprintf("%s:%d", n.dnsBindAddr, n.dnsPort)
+	tcpLn, err := net.Listen("tcp", tcpAddr)
+	if err != nil {
+		_ = udpConn.Close()
+		return nil, nil, fmt.Errorf("bind dns tcp %s: %w", tcpAddr, err)
+	}
+	return udpConn, tcpLn, nil
+}
+
 func (n *Native) startDNS(ctx context.Context) error {
 	ip := net.ParseIP(n.publicIP)
 	if ip == nil {
@@ -199,6 +228,11 @@ func (n *Native) startDNS(ctx context.Context) error {
 		}
 	})
 
+	udpConn, tcpLn, err := n.bindDNS()
+	if err != nil {
+		return err
+	}
+
 	// Accept UPDATE messages (OpcodeUpdate=5) in addition to the default
 	// OpcodeQuery and OpcodeNotify. The DefaultMsgAcceptFunc rejects them.
 	acceptFunc := func(dh dns.Header) dns.MsgAcceptAction {
@@ -208,26 +242,7 @@ func (n *Native) startDNS(ctx context.Context) error {
 		}
 		return dns.DefaultMsgAcceptFunc(dh)
 	}
-	tsigSecrets := map[string]string{}
-	if n.tsigKeyName != "" && n.tsigKeyB64 != "" {
-		tsigSecrets[n.tsigKeyName] = n.tsigKeyB64
-	}
-
-	// Pre-bind UDP so we know the actual port before starting TCP.
-	// This eliminates the TOCTOU race when dnsPort is 0.
-	udpAddr := fmt.Sprintf("%s:%d", n.dnsBindAddr, n.dnsPort)
-	udpConn, err := net.ListenPacket("udp", udpAddr)
-	if err != nil {
-		return fmt.Errorf("bind dns udp %s: %w", udpAddr, err)
-	}
-	n.dnsPort = udpConn.LocalAddr().(*net.UDPAddr).Port
-
-	tcpAddr := fmt.Sprintf("%s:%d", n.dnsBindAddr, n.dnsPort)
-	tcpLn, err := net.Listen("tcp", tcpAddr)
-	if err != nil {
-		_ = udpConn.Close()
-		return fmt.Errorf("bind dns tcp %s: %w", tcpAddr, err)
-	}
+	tsigSecrets := n.tsigSecrets()
 
 	udpStarted := make(chan struct{})
 	n.dnsUDPServer = &dns.Server{
