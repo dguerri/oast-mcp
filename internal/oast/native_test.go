@@ -38,36 +38,16 @@ const testPublicIP = "1.2.3.4"
 const testTSIGKeyName = "caddy."
 const testTSIGKeyHex = "0102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f20"
 
-func freeUDPPort(t *testing.T) int {
-	t.Helper()
-	conn, err := net.ListenPacket("udp", "127.0.0.1:0")
-	require.NoError(t, err)
-	port := conn.LocalAddr().(*net.UDPAddr).Port
-	_ = conn.Close()
-	return port
-}
-
-func freeTCPPort(t *testing.T) int {
-	t.Helper()
-	l, err := net.Listen("tcp", "127.0.0.1:0")
-	require.NoError(t, err)
-	port := l.Addr().(*net.TCPAddr).Port
-	_ = l.Close()
-	return port
-}
-
 func newTestNative(t *testing.T, sink oast.EventSink) (*oast.Native, int, int) {
 	t.Helper()
-	dnsPort := freeUDPPort(t)
-	httpPort := freeTCPPort(t)
-	n := oast.NewNative(testZone, testPublicIP, "127.0.0.1", "127.0.0.1", dnsPort, httpPort, "", "", "", sink, slog.Default())
+	n := oast.NewNative(testZone, testPublicIP, "127.0.0.1", "127.0.0.1", 0, 0, "", "", "", sink, slog.Default())
 	ctx, cancel := context.WithCancel(context.Background())
 	t.Cleanup(func() {
 		cancel()
 		n.Stop()
 	})
 	require.NoError(t, n.StartPolling(ctx))
-	return n, dnsPort, httpPort
+	return n, n.DNSPort(), n.HTTPPort()
 }
 
 func TestNative_NewSession_UniqueCorrelationIDs(t *testing.T) {
@@ -258,14 +238,12 @@ func TestNative_DNS_TXT_NotFound(t *testing.T) {
 
 func newTestNativeWithTSIG(t *testing.T, sink oast.EventSink) (*oast.Native, int, int) {
 	t.Helper()
-	dnsPort := freeUDPPort(t)
-	httpPort := freeTCPPort(t)
 	n := oast.NewNative(testZone, testPublicIP, "127.0.0.1", "127.0.0.1",
-		dnsPort, httpPort, testTSIGKeyName, testTSIGKeyHex, "127.0.0.1", sink, slog.Default())
+		0, 0, testTSIGKeyName, testTSIGKeyHex, "127.0.0.1", sink, slog.Default())
 	ctx, cancel := context.WithCancel(context.Background())
 	t.Cleanup(func() { cancel(); n.Stop() })
 	require.NoError(t, n.StartPolling(ctx))
-	return n, dnsPort, httpPort
+	return n, n.DNSPort(), n.HTTPPort()
 }
 
 func tsigKeyB64(t *testing.T) string {
@@ -436,10 +414,8 @@ func TestNative_RFC2136_NonAcmeTarget_Refused(t *testing.T) {
 func TestNative_RFC2136_AllowedAddr_Accepted(t *testing.T) {
 	// Allowed addr = "127.0.0.1"; test client sends from 127.0.0.1 → must succeed.
 	sink := &testSink{}
-	dnsPort := freeUDPPort(t)
-	httpPort := freeTCPPort(t)
 	n := oast.NewNative(testZone, testPublicIP, "127.0.0.1", "127.0.0.1",
-		dnsPort, httpPort, testTSIGKeyName, testTSIGKeyHex, "127.0.0.1", sink, slog.Default())
+		0, 0, testTSIGKeyName, testTSIGKeyHex, "127.0.0.1", sink, slog.Default())
 	ctx, cancel := context.WithCancel(context.Background())
 	t.Cleanup(func() { cancel(); n.Stop() })
 	require.NoError(t, n.StartPolling(ctx))
@@ -451,7 +427,7 @@ func TestNative_RFC2136_AllowedAddr_Accepted(t *testing.T) {
 		},
 		Txt: []string{"allowed-token"},
 	}
-	resp := sendUpdate(t, dnsPort, []dns.RR{rr}, testTSIGKeyName, tsigKeyB64(t))
+	resp := sendUpdate(t, n.DNSPort(), []dns.RR{rr}, testTSIGKeyName, tsigKeyB64(t))
 	assert.Equal(t, dns.RcodeSuccess, resp.Rcode)
 }
 
@@ -502,10 +478,8 @@ func TestNative_RFC2136_TCP_AddTXT(t *testing.T) {
 func TestNative_RFC2136_DisallowedAddr_Refused(t *testing.T) {
 	// Allowed addr = "192.0.2.1"; test client sends from 127.0.0.1 → must be refused.
 	sink := &testSink{}
-	dnsPort := freeUDPPort(t)
-	httpPort := freeTCPPort(t)
 	n := oast.NewNative(testZone, testPublicIP, "127.0.0.1", "127.0.0.1",
-		dnsPort, httpPort, testTSIGKeyName, testTSIGKeyHex, "192.0.2.1", sink, slog.Default())
+		0, 0, testTSIGKeyName, testTSIGKeyHex, "192.0.2.1", sink, slog.Default())
 	ctx, cancel := context.WithCancel(context.Background())
 	t.Cleanup(func() { cancel(); n.Stop() })
 	require.NoError(t, n.StartPolling(ctx))
@@ -517,7 +491,7 @@ func TestNative_RFC2136_DisallowedAddr_Refused(t *testing.T) {
 		},
 		Txt: []string{"should-be-refused"},
 	}
-	resp := sendUpdate(t, dnsPort, []dns.RR{rr}, testTSIGKeyName, tsigKeyB64(t))
+	resp := sendUpdate(t, n.DNSPort(), []dns.RR{rr}, testTSIGKeyName, tsigKeyB64(t))
 	assert.Equal(t, dns.RcodeRefused, resp.Rcode)
 }
 

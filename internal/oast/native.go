@@ -29,8 +29,8 @@ import (
 	"time"
 	"unicode/utf8"
 
-	"github.com/miekg/dns"
 	"github.com/dguerri/oast-mcp/internal/store"
+	"github.com/miekg/dns"
 )
 
 // Native is an in-process OAST responder. It runs a DNS server (UDP) on dnsPort
@@ -213,32 +213,46 @@ func (n *Native) startDNS(ctx context.Context) error {
 		tsigSecrets[n.tsigKeyName] = n.tsigKeyB64
 	}
 
+	// Pre-bind UDP so we know the actual port before starting TCP.
+	// This eliminates the TOCTOU race when dnsPort is 0.
+	udpAddr := fmt.Sprintf("%s:%d", n.dnsBindAddr, n.dnsPort)
+	udpConn, err := net.ListenPacket("udp", udpAddr)
+	if err != nil {
+		return fmt.Errorf("bind dns udp %s: %w", udpAddr, err)
+	}
+	n.dnsPort = udpConn.LocalAddr().(*net.UDPAddr).Port
+
+	tcpAddr := fmt.Sprintf("%s:%d", n.dnsBindAddr, n.dnsPort)
+	tcpLn, err := net.Listen("tcp", tcpAddr)
+	if err != nil {
+		_ = udpConn.Close()
+		return fmt.Errorf("bind dns tcp %s: %w", tcpAddr, err)
+	}
+
 	udpStarted := make(chan struct{})
 	n.dnsUDPServer = &dns.Server{
-		Addr:              fmt.Sprintf("%s:%d", n.dnsBindAddr, n.dnsPort),
-		Net:               "udp",
+		PacketConn:        udpConn,
 		Handler:           mux,
 		NotifyStartedFunc: func() { close(udpStarted) },
 		MsgAcceptFunc:     acceptFunc,
 		TsigSecret:        tsigSecrets,
 	}
 	go func() {
-		if err := n.dnsUDPServer.ListenAndServe(); err != nil && ctx.Err() == nil {
+		if err := n.dnsUDPServer.ActivateAndServe(); err != nil && ctx.Err() == nil {
 			n.logger.Error("dns udp server stopped", "err", err)
 		}
 	}()
 
 	tcpStarted := make(chan struct{})
 	n.dnsTCPServer = &dns.Server{
-		Addr:              fmt.Sprintf("%s:%d", n.dnsBindAddr, n.dnsPort),
-		Net:               "tcp",
+		Listener:          tcpLn,
 		Handler:           mux,
 		NotifyStartedFunc: func() { close(tcpStarted) },
 		MsgAcceptFunc:     acceptFunc,
 		TsigSecret:        tsigSecrets,
 	}
 	go func() {
-		if err := n.dnsTCPServer.ListenAndServe(); err != nil && ctx.Err() == nil {
+		if err := n.dnsTCPServer.ActivateAndServe(); err != nil && ctx.Err() == nil {
 			n.logger.Error("dns tcp server stopped", "err", err)
 		}
 	}()
@@ -262,6 +276,7 @@ func (n *Native) startHTTP(ctx context.Context) error {
 	if err != nil {
 		return fmt.Errorf("bind http callback port %d: %w", n.httpPort, err)
 	}
+	n.httpPort = l.Addr().(*net.TCPAddr).Port
 	mux := http.NewServeMux()
 	mux.HandleFunc("/", n.handleHTTP)
 	n.httpServer = &http.Server{Handler: mux}
@@ -272,6 +287,15 @@ func (n *Native) startHTTP(ctx context.Context) error {
 	}()
 	return nil
 }
+
+// DNSPort returns the port the DNS server is bound to. When constructed with
+// port 0, this returns the actual OS-assigned port after StartPolling.
+func (n *Native) DNSPort() int { return n.dnsPort }
+
+// HTTPPort returns the port the HTTP callback server is bound to. When
+// constructed with port 0, this returns the actual OS-assigned port after
+// StartPolling.
+func (n *Native) HTTPPort() int { return n.httpPort }
 
 // soaRR returns the SOA record for the zone.
 func (n *Native) soaRR() *dns.SOA {
