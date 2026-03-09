@@ -488,7 +488,7 @@ The token is recorded in the revocation store and rejected on all subsequent req
 | **Infrastructure**   | Self-Hosted (GCP/Terraform) | Public / 3rd Party          | Local Data / APIs        |
 | **OAST Callbacks**   | DNS, HTTP, HTTPS            | DNS, HTTP, HTTPS, SMTP, ... | N/A (Analyzes logs)      |
 | **Payload Gen**      | Yes (Built-in templates)    | No                          | N/A                      |
-| **Retrieval**        | Blocking Wait               | Polling                     | N/A                      |
+| **Retrieval**        | Wait and polling            | Polling                     | N/A                      |
 | **Post-Exploit**     | Yes (Two-stage Agents, RCE) | No                          | No                       |
 | **Setup Friction**   | High (Cloud, DNS, Certs)    | Extremely Low (`npx`)       | Low (Binary install)     |
 | **Data Privacy**     | High (100% Owned)           | Low (if using public fleet) | High (Local analysis)    |
