@@ -55,16 +55,36 @@ func (s *Server) registerAgentTools() {
 		mcpgo.WithString("agent_id", mcpgo.Required(), mcpgo.Description("The agent ID to schedule the task for")),
 		mcpgo.WithString("capability", mcpgo.Required(), mcpgo.Description("One of: exec, read_file, fetch_url, system_info")),
 		mcpgo.WithObject("params", mcpgo.Description("Parameters for the capability (see tool description for schema per capability)")),
-		mcpgo.WithNumber("timeout_secs", mcpgo.Description(fmt.Sprintf("Task timeout in seconds (default %d, max 86400)", store.DefaultTaskTimeoutSecs))),
+		mcpgo.WithNumber("timeout_secs", mcpgo.Description(fmt.Sprintf(
+			"Task execution timeout in seconds (default %d, max 86400). "+
+				"This is the deadline for the agent to finish the task — not the wait timeout in agent_task_status.",
+			store.DefaultTaskTimeoutSecs))),
 	)
 
 	statusTool := mcpgo.NewTool("agent_task_status",
 		mcpgo.WithDescription("Get the status and result of a scheduled agent task. "+
-			"Status progresses: pending → running → done | error. "+
-			"Poll every few seconds until status is 'done' or 'error'. "+
-			"On success, 'result' contains the capability output (e.g. exec: {output, exit_code}; read_file: {content, path} base64-encoded; fetch_url: {status, body} base64-encoded). "+
+			"Status progresses: pending → running → done | error.\n\n"+
+			"By default (wait=true), this tool blocks server-side until the task reaches a terminal state "+
+			"('done' or 'error') or the wait timeout elapses — no polling needed. "+
+			"The response includes timed_out=true if the wait timeout fired before the task completed. "+
+			"If the task is already in a terminal state, the tool returns immediately regardless of wait.\n\n"+
+			"Set wait=false to get the current status instantly without blocking. "+
+			"Use wait=false when you need to check multiple tasks in parallel, when you want to show "+
+			"intermediate progress to the user, or when you have other work to do between checks.\n\n"+
+			"timeout_secs controls how long this tool call blocks (default 30, max 120). "+
+			"This is the *wait timeout* — it only affects how long this status query blocks. "+
+			"It is independent of the *task timeout* set in agent_task_schedule, which controls "+
+			"how long the agent has to finish the task overall.\n\n"+
+			"On success, 'result' contains the capability output (e.g. exec: {output, exit_code}; "+
+			"read_file: {content, path} base64-encoded; fetch_url: {status, body} base64-encoded). "+
 			"On error, 'error' contains the error message."),
 		mcpgo.WithString("task_id", mcpgo.Required(), mcpgo.Description("The task ID to check")),
+		mcpgo.WithBoolean("wait", mcpgo.Description(
+			"Block until the task completes or the wait timeout elapses (default: true). "+
+				"Set to false to return the current status immediately without blocking.")),
+		mcpgo.WithNumber("timeout_secs", mcpgo.Description(
+			"Wait timeout in seconds (default 30, max 120). Only applies when wait=true. "+
+				"This controls how long this status call blocks — not the task's execution deadline.")),
 	)
 
 	cancelTool := mcpgo.NewTool("agent_task_cancel",
@@ -334,6 +354,41 @@ func (s *Server) handleAgentTaskCancel(ctx context.Context, req mcpgo.CallToolRe
 	})
 }
 
+const (
+	defaultWaitTimeoutSecs = 30
+	maxWaitTimeoutSecs     = 120
+	waitPollInterval       = 500 * time.Millisecond
+)
+
+// parseWaitParams extracts the wait (bool) and timeout_secs (int) parameters
+// from the tool arguments. Returns (wait, timeoutSecs).
+func parseWaitParams(args map[string]any) (bool, int) {
+	wait := true
+	if args != nil {
+		if v, ok := args["wait"]; ok {
+			if b, ok := v.(bool); ok {
+				wait = b
+			}
+		}
+	}
+
+	timeout := defaultWaitTimeoutSecs
+	if args != nil {
+		if v, ok := args["timeout_secs"]; ok {
+			if f, ok := v.(float64); ok {
+				timeout = int(f)
+			}
+		}
+	}
+	if timeout < 1 {
+		timeout = 1
+	}
+	if timeout > maxWaitTimeoutSecs {
+		timeout = maxWaitTimeoutSecs
+	}
+	return wait, timeout
+}
+
 // handleAgentTaskStatus handles the agent_task_status tool call.
 func (s *Server) handleAgentTaskStatus(ctx context.Context, req mcpgo.CallToolRequest) (*mcpgo.CallToolResult, error) {
 	claims, ok := claimsFromCtx(ctx)
@@ -353,6 +408,8 @@ func (s *Server) handleAgentTaskStatus(ctx context.Context, req mcpgo.CallToolRe
 		return toolError("task_id is required")
 	}
 
+	wait, waitTimeout := parseWaitParams(req.GetArguments())
+
 	task, err := s.store.GetTask(ctx, taskID, claims.TenantID)
 	if err != nil {
 		if errors.Is(err, store.ErrNotFound) {
@@ -360,6 +417,15 @@ func (s *Server) handleAgentTaskStatus(ctx context.Context, req mcpgo.CallToolRe
 		}
 		s.logger.Error("failed to get task", "error", err)
 		return toolError("failed to get task")
+	}
+
+	timedOut := false
+	if wait && !isTerminalStatus(task.Status) {
+		task, timedOut, err = s.pollUntilTaskDone(ctx, taskID, claims.TenantID, time.Now().Add(time.Duration(waitTimeout)*time.Second))
+		if err != nil {
+			s.logger.Error("failed to poll task", "error", err)
+			return toolError("failed to poll task")
+		}
 	}
 
 	ev := s.newAuditEvent(ctx, "agent.task.status", "ok")
@@ -376,6 +442,7 @@ func (s *Server) handleAgentTaskStatus(ctx context.Context, req mcpgo.CallToolRe
 		CompletedAt *string        `json:"completed_at,omitempty"`
 		Result      map[string]any `json:"result,omitempty"`
 		Err         string         `json:"error,omitempty"`
+		TimedOut    *bool          `json:"timed_out,omitempty"`
 	}
 
 	v := taskView{
@@ -387,6 +454,9 @@ func (s *Server) handleAgentTaskStatus(ctx context.Context, req mcpgo.CallToolRe
 		Result:     task.Result,
 		Err:        task.Err,
 	}
+	if wait {
+		v.TimedOut = &timedOut
+	}
 	if task.StartedAt != nil {
 		sa := task.StartedAt.Format(time.RFC3339)
 		v.StartedAt = &sa
@@ -396,6 +466,40 @@ func (s *Server) handleAgentTaskStatus(ctx context.Context, req mcpgo.CallToolRe
 		v.CompletedAt = &ca
 	}
 	return toolJSON(v)
+}
+
+// isTerminalStatus returns true if the task status is a terminal state.
+func isTerminalStatus(status string) bool {
+	return status == "done" || status == "error"
+}
+
+// pollUntilTaskDone polls the store every 500ms until the task reaches a
+// terminal state, the deadline elapses, or the context is cancelled.
+func (s *Server) pollUntilTaskDone(ctx context.Context, taskID, tenantID string, deadline time.Time) (*store.Task, bool, error) {
+	ticker := time.NewTicker(waitPollInterval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			// Context cancelled — return last known state.
+			task, err := s.store.GetTask(ctx, taskID, tenantID)
+			if err != nil {
+				return nil, false, err
+			}
+			return task, true, nil
+		case <-ticker.C:
+			task, err := s.store.GetTask(ctx, taskID, tenantID)
+			if err != nil {
+				return nil, false, err
+			}
+			if isTerminalStatus(task.Status) {
+				return task, false, nil
+			}
+			if !time.Now().Before(deadline) {
+				return task, true, nil
+			}
+		}
+	}
 }
 
 // handleAgentDropperGenerate handles the agent_dropper_generate tool call.

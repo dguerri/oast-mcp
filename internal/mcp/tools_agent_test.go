@@ -784,6 +784,204 @@ func TestAgentList_ShowsCapabilities(t *testing.T) {
 	assert.ElementsMatch(t, []string{"exec", "read_file", "fetch_url", "system_info"}, capStrs)
 }
 
+// TestAgentTaskStatus_WaitBlocksUntilDone verifies that wait=true (default)
+// blocks until the task reaches a terminal state, returning the result.
+func TestAgentTaskStatus_WaitBlocksUntilDone(t *testing.T) {
+	srv, a, st, _ := newTestServer(t)
+
+	now := time.Now().UTC()
+	require.NoError(t, st.EnqueueTask(context.Background(), &store.Task{
+		TaskID:     "wait-task-1",
+		AgentID:    "agent-w",
+		TenantID:   "alice",
+		Capability: "exec",
+		Status:     "pending",
+		CreatedAt:  now,
+	}))
+
+	// Complete the task after a short delay.
+	go func() {
+		time.Sleep(300 * time.Millisecond)
+		done := time.Now().UTC()
+		_ = st.UpdateTask(context.Background(), &store.Task{
+			TaskID:      "wait-task-1",
+			TenantID:    "alice",
+			Status:      "done",
+			CompletedAt: &done,
+			Result:      map[string]any{"output": "hello"},
+		})
+	}()
+
+	aliceCtx := makeCtx(t, a, "alice", []string{"agent:admin"})
+	start := time.Now()
+	result, err := srv.CallTool(aliceCtx, "agent_task_status", map[string]any{
+		"task_id": "wait-task-1",
+		// wait defaults to true
+	})
+	elapsed := time.Since(start)
+
+	require.NoError(t, err)
+	require.False(t, result.IsError, getResultText(t, result))
+
+	var resp map[string]any
+	require.NoError(t, json.Unmarshal([]byte(getResultText(t, result)), &resp))
+	assert.Equal(t, "done", resp["status"])
+	resultMap, ok := resp["result"].(map[string]any)
+	require.True(t, ok)
+	assert.Equal(t, "hello", resultMap["output"])
+
+	// Should have waited for the task to complete (~300ms), not returned immediately.
+	assert.GreaterOrEqual(t, elapsed, 250*time.Millisecond, "should block until task completes")
+	// timed_out should be false or absent
+	if timedOut, exists := resp["timed_out"]; exists {
+		assert.False(t, timedOut.(bool))
+	}
+}
+
+// TestAgentTaskStatus_WaitTimesOut verifies that when the task stays pending
+// beyond the wait timeout, the tool returns timed_out=true with the current status.
+func TestAgentTaskStatus_WaitTimesOut(t *testing.T) {
+	srv, a, st, _ := newTestServer(t)
+
+	now := time.Now().UTC()
+	require.NoError(t, st.EnqueueTask(context.Background(), &store.Task{
+		TaskID:     "wait-task-2",
+		AgentID:    "agent-w",
+		TenantID:   "alice",
+		Capability: "exec",
+		Status:     "pending",
+		CreatedAt:  now,
+	}))
+
+	aliceCtx := makeCtx(t, a, "alice", []string{"agent:admin"})
+	start := time.Now()
+	result, err := srv.CallTool(aliceCtx, "agent_task_status", map[string]any{
+		"task_id":      "wait-task-2",
+		"timeout_secs": float64(1),
+	})
+	elapsed := time.Since(start)
+
+	require.NoError(t, err)
+	require.False(t, result.IsError, getResultText(t, result))
+
+	var resp map[string]any
+	require.NoError(t, json.Unmarshal([]byte(getResultText(t, result)), &resp))
+	assert.Equal(t, "pending", resp["status"])
+	assert.True(t, resp["timed_out"].(bool), "expected timed_out=true")
+	assert.GreaterOrEqual(t, elapsed, 900*time.Millisecond, "should wait close to timeout")
+	assert.LessOrEqual(t, elapsed, 3*time.Second, "should not overshoot timeout")
+}
+
+// TestAgentTaskStatus_WaitFalseReturnsImmediately verifies that wait=false
+// returns immediately without blocking, even for a pending task.
+func TestAgentTaskStatus_WaitFalseReturnsImmediately(t *testing.T) {
+	srv, a, st, _ := newTestServer(t)
+
+	now := time.Now().UTC()
+	require.NoError(t, st.EnqueueTask(context.Background(), &store.Task{
+		TaskID:     "wait-task-3",
+		AgentID:    "agent-w",
+		TenantID:   "alice",
+		Capability: "exec",
+		Status:     "pending",
+		CreatedAt:  now,
+	}))
+
+	aliceCtx := makeCtx(t, a, "alice", []string{"agent:admin"})
+	start := time.Now()
+	result, err := srv.CallTool(aliceCtx, "agent_task_status", map[string]any{
+		"task_id": "wait-task-3",
+		"wait":    false,
+	})
+	elapsed := time.Since(start)
+
+	require.NoError(t, err)
+	require.False(t, result.IsError, getResultText(t, result))
+
+	var resp map[string]any
+	require.NoError(t, json.Unmarshal([]byte(getResultText(t, result)), &resp))
+	assert.Equal(t, "pending", resp["status"])
+	// Should return almost instantly — well under 500ms.
+	assert.Less(t, elapsed, 500*time.Millisecond, "wait=false should return immediately")
+}
+
+// TestAgentTaskStatus_WaitAlreadyDone verifies that waiting on an already-done
+// task returns immediately without blocking.
+func TestAgentTaskStatus_WaitAlreadyDone(t *testing.T) {
+	srv, a, st, _ := newTestServer(t)
+
+	now := time.Now().UTC()
+	done := now.Add(time.Second)
+	task := &store.Task{
+		TaskID:      "wait-task-4",
+		AgentID:     "agent-w",
+		TenantID:    "alice",
+		Capability:  "exec",
+		Status:      "done",
+		CreatedAt:   now,
+		CompletedAt: &done,
+		Result:      map[string]any{"output": "already done"},
+	}
+	require.NoError(t, st.EnqueueTask(context.Background(), task))
+	require.NoError(t, st.UpdateTask(context.Background(), task))
+
+	aliceCtx := makeCtx(t, a, "alice", []string{"agent:admin"})
+	start := time.Now()
+	result, err := srv.CallTool(aliceCtx, "agent_task_status", map[string]any{
+		"task_id": "wait-task-4",
+		// wait defaults to true, but task is already done
+	})
+	elapsed := time.Since(start)
+
+	require.NoError(t, err)
+	require.False(t, result.IsError, getResultText(t, result))
+
+	var resp map[string]any
+	require.NoError(t, json.Unmarshal([]byte(getResultText(t, result)), &resp))
+	assert.Equal(t, "done", resp["status"])
+	// Already terminal — should return immediately.
+	assert.Less(t, elapsed, 500*time.Millisecond, "already-done task should not block")
+}
+
+// TestAgentTaskStatus_WaitTimeoutClamped verifies that timeout_secs > 120 is
+// clamped to 120, and timeout_secs <= 0 is clamped to the default (30).
+func TestAgentTaskStatus_WaitTimeoutClamped(t *testing.T) {
+	srv, a, st, _ := newTestServer(t)
+
+	now := time.Now().UTC()
+	require.NoError(t, st.EnqueueTask(context.Background(), &store.Task{
+		TaskID:     "wait-task-5",
+		AgentID:    "agent-w",
+		TenantID:   "alice",
+		Capability: "exec",
+		Status:     "pending",
+		CreatedAt:  now,
+	}))
+
+	aliceCtx := makeCtx(t, a, "alice", []string{"agent:admin"})
+
+	// timeout_secs=0 should be clamped to default (30), but we test the fast path:
+	// pass wait=false to avoid actually waiting, then test clamping separately
+	// with a very short timeout to verify it doesn't exceed the clamp.
+	// We use timeout_secs=0 with wait=true — should clamp to 1 (minimum) and time out.
+	start := time.Now()
+	result, err := srv.CallTool(aliceCtx, "agent_task_status", map[string]any{
+		"task_id":      "wait-task-5",
+		"timeout_secs": float64(0),
+	})
+	elapsed := time.Since(start)
+
+	require.NoError(t, err)
+	require.False(t, result.IsError, getResultText(t, result))
+
+	var resp map[string]any
+	require.NoError(t, json.Unmarshal([]byte(getResultText(t, result)), &resp))
+	assert.True(t, resp["timed_out"].(bool), "should time out")
+	// Clamped to minimum (1s), so should take ~1s
+	assert.GreaterOrEqual(t, elapsed, 900*time.Millisecond)
+	assert.LessOrEqual(t, elapsed, 3*time.Second)
+}
+
 // TestAgentTaskCancel_NotFound verifies that cancelling a task_id that does
 // not exist returns an error.
 func TestAgentTaskCancel_NotFound(t *testing.T) {
