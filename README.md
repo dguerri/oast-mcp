@@ -19,7 +19,7 @@ All from a single, audited MCP interface.
 │          AI Assistant (Claude, GPT-4o, …)              │
 │            MCP client → SSE transport                  │
 └───────────────────────┬────────────────────────────────┘
-                        │ HTTPS (Caddy TLS termination)
+                     │ HTTPS (Caddy TLS termination)
 ┌───────────────────────▼────────────────────────────────┐
 │  oast-mcp  (127.0.0.1)                                 │
 │  ┌─────────────────┐   ┌──────────────────────────┐    │
