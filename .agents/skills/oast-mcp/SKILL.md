@@ -42,7 +42,7 @@ probe OS/arch → agent_dropper_generate → run command on target → agent_lis
 2. **`agent_dropper_generate`**: pass `agent_id`, `os_arch`, `ttl`, and `delivery`.
    - `delivery: "url"` — target fetches loader over HTTPS. Returns `curl_cmd`, `wget_cmd`, `python3_cmd`.
    - `delivery: "inline"` — loader embedded as base64 (~77KB). Returns `b64_cmd`, `python3_b64_cmd`. No outbound HTTP needed.
-   - `insecure: true` — (optional) skip TLS verification. Use ONLY when the target has no CA bundle (e.g. minimal containers). Adds `-k` to the loader and all download commands.
+   - `insecure: true` — (optional) skip TLS certificate verification end-to-end. Use ONLY when the target has no CA bundle (e.g. minimal containers). Adds `-k` to the loader and all download commands; the flag is propagated to Stage 2 so the agent's WebSocket connection and `fetch_url` requests also skip verification. **This is recorded in the audit log and stored in the agent session.**
 3. **Try commands in fallback order** — assume nothing is installed. Stop at the first that succeeds:
 
    | Platform | Fallback chain |
@@ -57,9 +57,13 @@ probe OS/arch → agent_dropper_generate → run command on target → agent_lis
 
    **The loader daemonizes immediately** — the dropper command returns right away while Stage 2 is downloaded in the background. This is critical for web exploitation where the parent process (e.g. a request handler) may be killed when the HTTP request ends.
 
-4. **`agent_list`** — confirm `status: "online"` before scheduling. Because the loader daemonizes, the agent may not appear instantly — wait a few seconds and poll `agent_list` until it shows `status: "online"`. The agent token `--sub` must match the MCP session subject (same tenant).
-5. **`agent_task_schedule`** → returns `task_id` immediately (async).
-6. **Poll `agent_task_status`** every 3s until `status` is `done` or `error`.
+4. **`agent_list`** — confirm `status: "online"` before scheduling. Because the loader daemonizes, the agent may not appear instantly — wait a few seconds and poll `agent_list` until it shows `status: "online"`. The agent token `--sub` must match the MCP session subject (same tenant). The response includes an `insecure` field indicating whether the agent is running in certificate-skip mode.
+5. **`agent_task_schedule`** → returns `task_id` immediately (async). The `timeout_secs` parameter here is the **task execution timeout** — the deadline for the agent to finish the work (default 600s, max 86400s).
+6. **`agent_task_status`** — by default blocks server-side (up to 30s) until the task completes. No polling needed.
+   - `wait` (bool, default `true`): blocks until `done`/`error` or the wait timeout elapses.
+   - `timeout_secs` (number, default 30, max 120): how long this status call blocks — independent of the task execution timeout set in step 5.
+   - If `timed_out: true`, the task is still running — call `agent_task_status` again.
+   - Set `wait: false` to get current status instantly (use when checking multiple tasks in parallel).
 
 ## Capability Reference
 
@@ -72,6 +76,8 @@ probe OS/arch → agent_dropper_generate → run command on target → agent_lis
 
 `read_file` and `fetch_url` results are base64-encoded — decode before interpreting content.
 
+> **`fetch_url` and TLS:** when the agent was deployed with `insecure: true`, `fetch_url` also skips TLS certificate verification. On targets without a CA bundle, use HTTP URLs or deploy with `insecure: true` to reach HTTPS targets.
+
 ---
 
 ## Common Mistakes
@@ -79,8 +85,11 @@ probe OS/arch → agent_dropper_generate → run command on target → agent_lis
 | Mistake | Fix |
 |---------|-----|
 | `agent_list` returns empty after running dropper | The loader daemonizes and returns immediately — the agent needs a few seconds to download Stage 2 and connect. Wait and retry `agent_list`. Also check that the token `--sub` equals the MCP session subject (same tenant). If the agent never appears, retry with `-f` added to the loader command to see errors on stderr |
-| Agent fails on minimal container / no CA certs | Set `insecure: true` in `agent_dropper_generate` or add `-k` to the loader command. Use only when strictly needed |
+| Agent fails on minimal container / no CA certs | Set `insecure: true` in `agent_dropper_generate` or add `-k` to the loader command. Use only when strictly needed — the flag is audited and stored in the agent's session record |
+| `fetch_url` fails with certificate error | The agent was deployed without `insecure: true`. On targets without a CA bundle, use HTTP URLs or redeploy with `insecure: true` |
 | Task stuck in `pending` | Confirm agent is `online` first; dispatch loop polls every 2s |
+| Polling `agent_task_status` with `wait: false` in a loop | Use the default `wait: true` — it blocks server-side up to 30s. Only use `wait: false` for parallel task checks |
+| Confusing task timeout with wait timeout | `timeout_secs` in `agent_task_schedule` = agent execution deadline. `timeout_secs` in `agent_task_status` = how long the status call blocks |
 | Polling `oast_list_events` in a loop after injection | Use `oast_wait_for_event` — it blocks server-side; `list_events` returns history only |
 | `oast_wait_for_event` always times out | (1) Verify payload was injected into the target, not just fetched locally; (2) confirm `session_id` matches the one from `oast_create_session` — a stale or different ID means events route to a different session |
 | Curling the callback URL yourself to "verify" | Don't. Self-fetching proves nothing — only the TARGET triggering the payload is a valid callback |

