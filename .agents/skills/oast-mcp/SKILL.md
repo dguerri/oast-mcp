@@ -42,6 +42,7 @@ probe OS/arch → agent_dropper_generate → run command on target → agent_lis
 2. **`agent_dropper_generate`**: pass `agent_id`, `os_arch`, `ttl`, and `delivery`.
    - `delivery: "url"` — target fetches loader over HTTPS. Returns `curl_cmd`, `wget_cmd`, `python3_cmd`.
    - `delivery: "inline"` — loader embedded as base64 (~77KB). Returns `b64_cmd`, `python3_b64_cmd`. No outbound HTTP needed.
+   - `insecure: true` — (optional) skip TLS verification. Use ONLY when the target has no CA bundle (e.g. minimal containers). Adds `-k` to the loader and all download commands.
 3. **Try commands in fallback order** — assume nothing is installed. Stop at the first that succeeds:
 
    | Platform | Fallback chain |
@@ -77,7 +78,8 @@ probe OS/arch → agent_dropper_generate → run command on target → agent_lis
 
 | Mistake | Fix |
 |---------|-----|
-| `agent_list` returns empty after running dropper | The loader daemonizes and returns immediately — the agent needs a few seconds to download Stage 2 and connect. Wait and retry `agent_list`. Also check that the token `--sub` equals the MCP session subject (same tenant) |
+| `agent_list` returns empty after running dropper | The loader daemonizes and returns immediately — the agent needs a few seconds to download Stage 2 and connect. Wait and retry `agent_list`. Also check that the token `--sub` equals the MCP session subject (same tenant). If the agent never appears, retry with `-f` added to the loader command to see errors on stderr |
+| Agent fails on minimal container / no CA certs | Set `insecure: true` in `agent_dropper_generate` or add `-k` to the loader command. Use only when strictly needed |
 | Task stuck in `pending` | Confirm agent is `online` first; dispatch loop polls every 2s |
 | Polling `oast_list_events` in a loop after injection | Use `oast_wait_for_event` — it blocks server-side; `list_events` returns history only |
 | `oast_wait_for_event` always times out | (1) Verify payload was injected into the target, not just fetched locally; (2) confirm `session_id` matches the one from `oast_create_session` — a stale or different ID means events route to a different session |

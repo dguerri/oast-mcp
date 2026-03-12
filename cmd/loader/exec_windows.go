@@ -26,12 +26,16 @@ import (
 	"golang.org/x/sys/windows"
 )
 
-func execAgent(path, serverURL, token, agentID string) {
+func execAgent(path, serverURL, token, agentID string, insecure bool) {
 	// Self-delete the loader binary on Windows — os.Remove fails on a running
 	// exe. markDeleteOnClose marks it for auto-deletion when we exit.
 	markDeleteOnClose(os.Args[0])
 
-	cmd := exec.Command(path, "-url", serverURL, "-token", token, "-id", agentID)
+	args := []string{"-url", serverURL, "-token", token, "-id", agentID}
+	if insecure {
+		args = append(args, "-k")
+	}
+	cmd := exec.Command(path, args...)
 	cmd.SysProcAttr = &syscall.SysProcAttr{
 		CreationFlags: syscall.CREATE_NEW_PROCESS_GROUP | _DETACHED_PROCESS,
 	}

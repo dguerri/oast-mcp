@@ -40,6 +40,7 @@ var (
 	serverURL = flag.String("url", "", "agent server base URL e.g. https://agent.example.com")
 	token     = flag.String("token", "", "agent JWT token")
 	agentID   = flag.String("id", "", "agent ID")
+	insecure  = flag.Bool("k", false, "skip TLS certificate verification")
 )
 
 type inMsg struct {
@@ -97,7 +98,7 @@ func wsURL(base string) string {
 }
 
 func runOnce() error {
-	dialer := websocket.Dialer{TLSClientConfig: &tls.Config{}} // default: validates cert
+	dialer := websocket.Dialer{TLSClientConfig: &tls.Config{InsecureSkipVerify: *insecure}} //nolint:gosec
 	conn, _, err := dialer.Dial(wsURL(*serverURL), nil)
 	if err != nil {
 		return err

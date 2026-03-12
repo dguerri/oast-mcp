@@ -22,8 +22,11 @@ import (
 	"syscall"
 )
 
-func execAgent(path, serverURL, token, agentID string) {
+func execAgent(path, serverURL, token, agentID string, insecure bool) {
 	args := []string{path, "-url", serverURL, "-token", token, "-id", agentID}
+	if insecure {
+		args = append(args, "-k")
+	}
 	if err := syscall.Exec(path, args, os.Environ()); err != nil {
 		fmt.Fprintln(os.Stderr, "exec error:", err)
 		os.Exit(1)
