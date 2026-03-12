@@ -46,6 +46,7 @@ type inMsg struct {
 	Name         string         `json:"name,omitempty"`
 	Capabilities []string       `json:"capabilities,omitempty"`
 	Token        string         `json:"token,omitempty"`
+	Insecure     bool           `json:"insecure,omitempty"`
 	TaskID       string         `json:"task_id,omitempty"`
 	Ok           bool           `json:"ok,omitempty"`
 	Data         map[string]any `json:"data,omitempty"`
@@ -278,6 +279,7 @@ func (s *Server) handleConn(ctx context.Context, ws *websocket.Conn) {
 		ExpiresAt:    &exp,
 		Capabilities: reg.Capabilities,
 		Status:       "online",
+		Insecure:     reg.Insecure,
 	}
 	if err := s.store.UpsertAgent(ctx, a); err != nil {
 		s.logger.Error("upsert agent", "err", err)

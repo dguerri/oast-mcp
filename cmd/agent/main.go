@@ -110,6 +110,7 @@ func runOnce() error {
 		"agent_id":     *agentID,
 		"token":        *token,
 		"capabilities": []string{"exec", "read_file", "fetch_url", "system_info"},
+		"insecure":     *insecure,
 	})
 	if err := conn.WriteMessage(websocket.TextMessage, reg); err != nil {
 		return err
@@ -229,6 +230,11 @@ func handleTask(ctx context.Context, msg inMsg) outMsg {
 	case agent.CapFetchURL:
 		rawURL, _ := params["url"].(string)
 		client := &http.Client{}
+		if *insecure {
+			client.Transport = &http.Transport{
+				TLSClientConfig: &tls.Config{InsecureSkipVerify: true}, //nolint:gosec
+			}
+		}
 		req, err := http.NewRequestWithContext(ctx, http.MethodGet, rawURL, nil)
 		if err != nil {
 			execErr = err.Error()

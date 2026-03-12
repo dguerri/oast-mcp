@@ -452,8 +452,8 @@ func (s *SQLiteStore) UpsertAgent(ctx context.Context, a *Agent) error {
 	}
 	_, err = s.db.ExecContext(ctx, `
 		INSERT OR REPLACE INTO agents
-			(agent_id, tenant_id, name, registered_at, last_seen_at, expires_at, capabilities_json, status)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+			(agent_id, tenant_id, name, registered_at, last_seen_at, expires_at, capabilities_json, status, insecure)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 		a.AgentID,
 		a.TenantID,
 		a.Name,
@@ -462,13 +462,14 @@ func (s *SQLiteStore) UpsertAgent(ctx context.Context, a *Agent) error {
 		nullTimeToStr(a.ExpiresAt),
 		capsJSON,
 		a.Status,
+		a.Insecure,
 	)
 	return err
 }
 
 func (s *SQLiteStore) GetAgent(ctx context.Context, agentID, tenantID string) (*Agent, error) {
 	row := s.db.QueryRowContext(ctx, `
-		SELECT agent_id, tenant_id, name, registered_at, last_seen_at, expires_at, capabilities_json, status
+		SELECT agent_id, tenant_id, name, registered_at, last_seen_at, expires_at, capabilities_json, status, insecure
 		FROM agents
 		WHERE agent_id = ? AND tenant_id = ?`,
 		agentID, tenantID,
@@ -478,7 +479,7 @@ func (s *SQLiteStore) GetAgent(ctx context.Context, agentID, tenantID string) (*
 
 func (s *SQLiteStore) ListAgents(ctx context.Context, tenantID string, includeExpired bool) ([]*Agent, error) {
 	query := `
-		SELECT agent_id, tenant_id, name, registered_at, last_seen_at, expires_at, capabilities_json, status
+		SELECT agent_id, tenant_id, name, registered_at, last_seen_at, expires_at, capabilities_json, status, insecure
 		FROM agents
 		WHERE tenant_id = ?`
 	args := []any{tenantID}
@@ -537,6 +538,7 @@ func scanAgent(row scanner) (*Agent, error) {
 		&expiresAtS,
 		&capsJSON,
 		&a.Status,
+		&a.Insecure,
 	)
 	if err == sql.ErrNoRows {
 		return nil, ErrNotFound

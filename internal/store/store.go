@@ -68,6 +68,7 @@ type Agent struct {
 	ExpiresAt    *time.Time
 	Capabilities []string
 	Status       string // online|offline
+	Insecure     bool
 }
 
 type Task struct {

@@ -179,12 +179,7 @@ func (s *Server) handleAgentList(ctx context.Context, req mcpgo.CallToolRequest)
 		return toolError("rate limit exceeded")
 	}
 
-	var showExpired bool
-	if args := req.GetArguments(); args != nil {
-		if v, ok := args["show_expired"]; ok {
-			showExpired, _ = v.(bool)
-		}
-	}
+	showExpired := req.GetBool("show_expired", false)
 
 	agents, err := s.store.ListAgents(ctx, claims.TenantID, showExpired)
 	if err != nil {
@@ -200,6 +195,7 @@ func (s *Server) handleAgentList(ctx context.Context, req mcpgo.CallToolRequest)
 		Name         string   `json:"name"`
 		Status       string   `json:"status"`
 		Capabilities []string `json:"capabilities"`
+		Insecure     bool     `json:"insecure"`
 		RegisteredAt string   `json:"registered_at"`
 		LastSeenAt   *string  `json:"last_seen_at,omitempty"`
 		ExpiresAt    *string  `json:"expires_at,omitempty"`
@@ -213,6 +209,7 @@ func (s *Server) handleAgentList(ctx context.Context, req mcpgo.CallToolRequest)
 			Name:         a.Name,
 			Status:       a.Status,
 			Capabilities: a.Capabilities,
+			Insecure:     a.Insecure,
 			RegisteredAt: a.RegisteredAt.Format(time.RFC3339),
 		}
 		if a.LastSeenAt != nil {
@@ -374,25 +371,11 @@ const (
 )
 
 // parseWaitParams extracts the wait (bool) and timeout_secs (int) parameters
-// from the tool arguments. Returns (wait, timeoutSecs).
-func parseWaitParams(args map[string]any) (bool, int) {
-	wait := true
-	if args != nil {
-		if v, ok := args["wait"]; ok {
-			if b, ok := v.(bool); ok {
-				wait = b
-			}
-		}
-	}
+// from the tool request. Returns (wait, timeoutSecs).
+func parseWaitParams(req mcpgo.CallToolRequest) (bool, int) {
+	wait := req.GetBool("wait", true)
 
-	timeout := defaultWaitTimeoutSecs
-	if args != nil {
-		if v, ok := args["timeout_secs"]; ok {
-			if f, ok := v.(float64); ok {
-				timeout = int(f)
-			}
-		}
-	}
+	timeout := req.GetInt("timeout_secs", defaultWaitTimeoutSecs)
 	if timeout < 1 {
 		timeout = 1
 	}
@@ -421,7 +404,7 @@ func (s *Server) handleAgentTaskStatus(ctx context.Context, req mcpgo.CallToolRe
 		return toolError("task_id is required")
 	}
 
-	wait, waitTimeout := parseWaitParams(req.GetArguments())
+	wait, waitTimeout := parseWaitParams(req)
 
 	task, err := s.store.GetTask(ctx, taskID, claims.TenantID)
 	if err != nil {
@@ -533,10 +516,7 @@ func (s *Server) handleAgentDropperGenerate(ctx context.Context, req mcpgo.CallT
 	osArch := req.GetString("os_arch", "")
 	ttlStr := req.GetString("ttl", "")
 	delivery := req.GetString("delivery", "url")
-	var insecureTLS bool
-	if args := req.GetArguments(); args != nil {
-		insecureTLS, _ = args["insecure"].(bool)
-	}
+	insecureTLS := req.GetBool("insecure", false)
 
 	ttl, errMsg := parseDropperParams(agentID, osArch, ttlStr, delivery)
 	if errMsg != "" {
@@ -571,6 +551,7 @@ func (s *Server) handleAgentDropperGenerate(ctx context.Context, req mcpgo.CallT
 
 	ev := s.newAuditEvent(ctx, "agent.dropper.generate", "ok")
 	ev.Resource = agentID
+	ev.Detail = map[string]any{"os_arch": osArch, "delivery": delivery, "insecure": insecureTLS}
 	s.audit.Log(ev)
 
 	result := map[string]any{
