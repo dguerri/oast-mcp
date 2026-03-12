@@ -54,7 +54,9 @@ probe OS/arch → agent_dropper_generate → run command on target → agent_lis
    If a command fails with "command not found" or "not recognized" → next fallback immediately.
    If all URL fallbacks fail → call `agent_dropper_generate` again with `delivery: "inline"`.
 
-4. **`agent_list`** — confirm `status: "online"` before scheduling. The agent token `--sub` must match the MCP session subject (same tenant).
+   **The loader daemonizes immediately** — the dropper command returns right away while Stage 2 is downloaded in the background. This is critical for web exploitation where the parent process (e.g. a request handler) may be killed when the HTTP request ends.
+
+4. **`agent_list`** — confirm `status: "online"` before scheduling. Because the loader daemonizes, the agent may not appear instantly — wait a few seconds and poll `agent_list` until it shows `status: "online"`. The agent token `--sub` must match the MCP session subject (same tenant).
 5. **`agent_task_schedule`** → returns `task_id` immediately (async).
 6. **Poll `agent_task_status`** every 3s until `status` is `done` or `error`.
 
@@ -75,7 +77,7 @@ probe OS/arch → agent_dropper_generate → run command on target → agent_lis
 
 | Mistake | Fix |
 |---------|-----|
-| `agent_list` returns empty after running dropper | Token `--sub` must equal the MCP session subject; different subjects = different tenants |
+| `agent_list` returns empty after running dropper | The loader daemonizes and returns immediately — the agent needs a few seconds to download Stage 2 and connect. Wait and retry `agent_list`. Also check that the token `--sub` equals the MCP session subject (same tenant) |
 | Task stuck in `pending` | Confirm agent is `online` first; dispatch loop polls every 2s |
 | Polling `oast_list_events` in a loop after injection | Use `oast_wait_for_event` — it blocks server-side; `list_events` returns history only |
 | `oast_wait_for_event` always times out | (1) Verify payload was injected into the target, not just fetched locally; (2) confirm `session_id` matches the one from `oast_create_session` — a stale or different ID means events route to a different session |

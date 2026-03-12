@@ -20,6 +20,7 @@ import (
 	"fmt"
 	"os"
 	"os/exec"
+	"syscall"
 	"unsafe"
 
 	"golang.org/x/sys/windows"
@@ -30,16 +31,18 @@ func execAgent(path, serverURL, token, agentID string) {
 	// exe. markDeleteOnClose marks it for auto-deletion when we exit.
 	markDeleteOnClose(os.Args[0])
 
-	// Mark the temp agent file for auto-deletion when the agent process exits.
-	markDeleteOnClose(path)
-
 	cmd := exec.Command(path, "-url", serverURL, "-token", token, "-id", agentID)
-	cmd.Stdout = os.Stdout
-	cmd.Stderr = os.Stderr
-	if err := cmd.Run(); err != nil {
+	cmd.SysProcAttr = &syscall.SysProcAttr{
+		CreationFlags: syscall.CREATE_NEW_PROCESS_GROUP | _DETACHED_PROCESS,
+	}
+	if err := cmd.Start(); err != nil {
 		fmt.Fprintln(os.Stderr, "exec error:", err)
 		os.Exit(1)
 	}
+
+	// Mark the temp agent file for auto-deletion when the agent process exits.
+	// Done after Start so the agent already holds a PE image handle.
+	markDeleteOnClose(path)
 }
 
 // markDeleteOnClose opens path with DELETE access and sets FileDispositionInfo

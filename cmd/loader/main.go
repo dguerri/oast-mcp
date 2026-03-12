@@ -35,6 +35,13 @@ func main() {
 	token := os.Args[2]
 	agentID := os.Args[3]
 
+	// Daemonize: re-exec self detached so a short-lived parent (e.g. a web
+	// request handler) returns immediately.  The sentinel env var prevents
+	// infinite re-exec.
+	if os.Getenv("_OAST_D") == "" {
+		daemonize() // does not return on success
+	}
+
 	// Self-delete immediately — the loader is one-shot.
 	// On Unix this succeeds on a running binary; on Windows it fails silently
 	// and exec_windows.go uses markDeleteOnClose instead.

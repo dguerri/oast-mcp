@@ -109,7 +109,11 @@ func (s *Server) registerAgentTools() {
 	dropperDesc := fmt.Sprintf(
 		"Mint an agent token and generate delivery commands for a two-stage agent.\n"+
 			"Stage 1 (loader) is tiny (~200KB for Linux, ~1.8MB for Windows) — deliver via URL or inline base64.\n"+
-			"Stage 1 downloads Stage 2 (the full agent) over authenticated HTTPS and execs it.\n\n"+
+			"Stage 1 daemonizes immediately (the dropper command returns right away) and then downloads "+
+			"Stage 2 (the full agent) over authenticated HTTPS in the background before exec-ing it.\n\n"+
+			"IMPORTANT: because the loader daemonizes, the dropper command exits before the agent is online. "+
+			"The agent typically appears within a few seconds, but it may take longer on slow connections. "+
+			"After running the dropper, wait a moment and then poll agent_list until the agent shows 'online'.\n\n"+
 			"Delivery modes (choose based on target environment):\n"+
 			"  url    — target fetches loader over HTTPS. Returns curl_cmd, wget_cmd, python3_cmd in fallback order.\n"+
 			"  inline — loader embedded as base64; no outbound HTTP needed. Returns b64_cmd and python3_b64_cmd fallback.\n\n"+
@@ -122,8 +126,8 @@ func (s *Server) registerAgentTools() {
 			"Workflow after achieving RCE:\n"+
 			"  1. Probe target OS/arch: uname -m (Linux) or $ENV:PROCESSOR_ARCHITECTURE (Windows).\n"+
 			"  2. Call agent_dropper_generate with agent_id, os_arch, ttl, and delivery mode.\n"+
-			"  3. Try each command in the fallback chain until one succeeds.\n"+
-			"  4. Call agent_list to confirm the agent appears as 'online'.\n"+
+			"  3. Try each command in the fallback chain until one succeeds (the command returns immediately).\n"+
+			"  4. Wait a few seconds, then call agent_list to confirm the agent appears as 'online'.\n"+
 			"  5. Use agent_task_schedule to run capabilities (exec, read_file, fetch_url, system_info).\n\n"+
 			"Available targets: %s", targetList)
 
