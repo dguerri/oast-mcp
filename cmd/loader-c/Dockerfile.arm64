@@ -18,14 +18,19 @@ RUN wget -q "https://github.com/Mbed-TLS/mbedtls/archive/refs/tags/v${MBEDTLS_VE
           -DENABLE_PROGRAMS=OFF \
           -DENABLE_TESTING=OFF \
           -DCMAKE_BUILD_TYPE=MinSizeRel \
+          -DCMAKE_C_FLAGS="-Os -ffunction-sections -fdata-sections -fno-asynchronous-unwind-tables" \
           > /dev/null && \
     cmake --build /tmp/mbedtls-build --parallel $(nproc) > /dev/null
 
-RUN gcc -O2 -static -s -o /loader /loader.c \
+RUN gcc -Os -static -s \
+        -ffunction-sections -fdata-sections \
+        -fno-asynchronous-unwind-tables -fno-stack-protector \
+        -o /loader /loader.c \
         -I /tmp/mbedtls-${MBEDTLS_VERSION}/include \
         /tmp/mbedtls-build/library/libmbedtls.a \
         /tmp/mbedtls-build/library/libmbedx509.a \
-        /tmp/mbedtls-build/library/libmbedcrypto.a && \
+        /tmp/mbedtls-build/library/libmbedcrypto.a \
+        -Wl,--gc-sections,--build-id=none && \
     upx --best --lzma /loader > /dev/null 2>&1
 
 FROM scratch

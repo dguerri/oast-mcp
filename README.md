@@ -91,7 +91,7 @@ make deploy
 | Step                 | What happens                                                                                                                                                                                                                                 |
 | -------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | `make cross`         | Cross-compiles the `oast-mcp` server binary for Linux amd64                                                                                                                                                                                  |
-| `make build-loaders` | Builds Stage 1 loaders: C/musl/mbedTLS for linux/amd64 and linux/arm64 (requires Docker, ~200KB each); Go cross-compile for windows/amd64                                                                                                    |
+| `make build-loaders` | Builds Stage 1 loaders: C/musl/mbedTLS for linux/amd64 and linux/arm64 (requires Docker, ~77KB each); Go cross-compile for windows/amd64                                                                                                     |
 | `make build-agents`  | Cross-compiles Stage 2 agent for linux/amd64, linux/arm64, windows/amd64; UPX-compresses if available                                                                                                                                        |
 | `make tf-apply`      | Creates GCP VM, static IP, firewall rules, DNS records (NS delegation + glue + mcp/agent A records), Caddy service account + key                                                                                                             |
 | `make inventory`     | Pulls `vm_public_ip` from Terraform state, generates `deploy/ansible/inventory/hosts.yml`                                                                                                                                                    |
@@ -293,9 +293,11 @@ Agents are two-stage Go binaries. The AI deploys them automatically after achiev
 ### Architecture
 
 ```
-Stage 1 — loader (Linux C/musl ~90-200KB, Windows Go ~1.8MB)
+Stage 1 — loader (Linux C/musl ~77KB, Windows Go ~1.8MB)
   Delivered to target via curl, wget, or inline base64.
-  Self-deletes immediately on first run (one-shot dropper).
+  Daemonizes immediately (double-fork on Linux, detached process on Windows)
+  so the parent (e.g. a web request handler) returns right away.
+  Self-deletes on first run (one-shot dropper).
   Downloads Stage 2 from /dl/second-stage/{os}-{arch} (token-gated).
   Linux:   Stage 2 loaded into anonymous memfd — never written to disk.
   Windows: Stage 2 written to a delete-on-close temp file, removed on agent exit;
@@ -450,8 +452,8 @@ make test
 
 ```bash
 # Linux loaders (C/musl/mbedTLS, requires Docker):
-#   bin/loader-linux-amd64   ~91 KB
-#   bin/loader-linux-arm64   ~91 KB
+#   bin/loader-linux-amd64   ~77 KB
+#   bin/loader-linux-arm64   ~77 KB
 # Windows loader (Go, no Docker required):
 #   bin/loader-windows-amd64.exe
 make build-loaders   # → bin/loader-{os}-{arch}[.exe]

@@ -108,7 +108,7 @@ func (s *Server) registerAgentTools() {
 	}
 	dropperDesc := fmt.Sprintf(
 		"Mint an agent token and generate delivery commands for a two-stage agent.\n"+
-			"Stage 1 (loader) is tiny (~200KB for Linux, ~1.8MB for Windows) — deliver via URL or inline base64.\n"+
+			"Stage 1 (loader) is tiny (~77KB for Linux, ~1.8MB for Windows) — deliver via URL or inline base64.\n"+
 			"Stage 1 daemonizes immediately (the dropper command returns right away) and then downloads "+
 			"Stage 2 (the full agent) over authenticated HTTPS in the background before exec-ing it.\n\n"+
 			"IMPORTANT: because the loader daemonizes, the dropper command exits before the agent is online. "+

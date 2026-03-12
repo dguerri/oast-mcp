@@ -41,7 +41,7 @@ probe OS/arch → agent_dropper_generate → run command on target → agent_lis
 1. **Probe** target: `uname -m` (Linux) or `$ENV:PROCESSOR_ARCHITECTURE` (Windows).
 2. **`agent_dropper_generate`**: pass `agent_id`, `os_arch`, `ttl`, and `delivery`.
    - `delivery: "url"` — target fetches loader over HTTPS. Returns `curl_cmd`, `wget_cmd`, `python3_cmd`.
-   - `delivery: "inline"` — loader embedded as base64 (~200KB). Returns `b64_cmd`, `python3_b64_cmd`. No outbound HTTP needed.
+   - `delivery: "inline"` — loader embedded as base64 (~77KB). Returns `b64_cmd`, `python3_b64_cmd`. No outbound HTTP needed.
 3. **Try commands in fallback order** — assume nothing is installed. Stop at the first that succeeds:
 
    | Platform | Fallback chain |
