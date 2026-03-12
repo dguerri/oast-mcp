@@ -28,18 +28,26 @@ func die(msg string) {
 	os.Exit(1)
 }
 
+// caBundlePaths is the list of well-known CA bundle locations checked on Unix.
+var caBundlePaths = []string{
+	"/etc/ssl/certs/ca-certificates.crt",
+	"/etc/pki/tls/certs/ca-bundle.crt",
+	"/etc/ssl/ca-bundle.pem",
+	"/etc/ssl/cert.pem",
+}
+
 // hasCABundle checks that at least one system CA bundle file is readable.
 // On Windows, Go uses the built-in certificate store so the check always passes.
 func hasCABundle() bool {
 	if runtime.GOOS == "windows" {
 		return true
 	}
-	for _, p := range []string{
-		"/etc/ssl/certs/ca-certificates.crt",
-		"/etc/pki/tls/certs/ca-bundle.crt",
-		"/etc/ssl/ca-bundle.pem",
-		"/etc/ssl/cert.pem",
-	} {
+	return hasCABundleAt(caBundlePaths)
+}
+
+// hasCABundleAt returns true when at least one of the given paths is stat-able.
+func hasCABundleAt(paths []string) bool {
+	for _, p := range paths {
 		if _, err := os.Stat(p); err == nil {
 			return true
 		}
