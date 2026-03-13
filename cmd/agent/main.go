@@ -51,6 +51,7 @@ type inMsg struct {
 	Params     map[string]any `json:"params,omitempty"`
 	Timeout    int            `json:"timeout,omitempty"` // seconds; 0 means use capability default
 	Message    string         `json:"message,omitempty"`
+	StdinData  string         `json:"data,omitempty"`
 }
 
 type outMsg struct {
@@ -59,38 +60,70 @@ type outMsg struct {
 	Ok     bool           `json:"ok,omitempty"`
 	Data   map[string]any `json:"data,omitempty"`
 	Error  string         `json:"error,omitempty"`
+	Stdout string         `json:"stdout,omitempty"`
+	Stderr string         `json:"stderr,omitempty"`
 }
 
-// taskRegistry tracks cancel functions for running tasks so that a cancel
-// message from the server can abort the corresponding subprocess.
+type taskEntry struct {
+	cancel context.CancelFunc
+	stdin  io.WriteCloser // nil for non-interactive tasks
+}
+
 type taskRegistry struct {
-	mu      sync.Mutex
-	cancels map[string]context.CancelFunc
+	mu    sync.Mutex
+	tasks map[string]*taskEntry
 }
 
 func newTaskRegistry() *taskRegistry {
-	return &taskRegistry{cancels: make(map[string]context.CancelFunc)}
+	return &taskRegistry{tasks: make(map[string]*taskEntry)}
 }
 
 func (r *taskRegistry) register(taskID string, cancel context.CancelFunc) {
 	r.mu.Lock()
-	r.cancels[taskID] = cancel
+	r.tasks[taskID] = &taskEntry{cancel: cancel}
+	r.mu.Unlock()
+}
+
+func (r *taskRegistry) registerInteractive(taskID string, cancel context.CancelFunc, stdin io.WriteCloser) {
+	r.mu.Lock()
+	r.tasks[taskID] = &taskEntry{cancel: cancel, stdin: stdin}
 	r.mu.Unlock()
 }
 
 func (r *taskRegistry) cancel(taskID string) {
 	r.mu.Lock()
-	if fn, ok := r.cancels[taskID]; ok {
-		fn()
+	if e, ok := r.tasks[taskID]; ok {
+		e.cancel()
 	}
 	r.mu.Unlock()
 }
 
+func (r *taskRegistry) writeStdin(taskID string, data []byte) error {
+	r.mu.Lock()
+	e, ok := r.tasks[taskID]
+	r.mu.Unlock()
+	if !ok || e.stdin == nil {
+		return fmt.Errorf("no stdin for task %s", taskID)
+	}
+	_, err := e.stdin.Write(data)
+	return err
+}
+
 func (r *taskRegistry) remove(taskID string) {
 	r.mu.Lock()
-	delete(r.cancels, taskID)
+	if e, ok := r.tasks[taskID]; ok {
+		if e.stdin != nil {
+			_ = e.stdin.Close()
+		}
+		delete(r.tasks, taskID)
+	}
 	r.mu.Unlock()
 }
+
+type nopWriteCloser struct{}
+
+func (nopWriteCloser) Write(p []byte) (int, error) { return len(p), nil }
+func (nopWriteCloser) Close() error                { return nil }
 
 func wsURL(base string) string {
 	u, _ := url.Parse(base)
@@ -180,6 +213,10 @@ func dispatchMessage(msg inMsg, results chan outMsg, registry *taskRegistry) err
 		results <- outMsg{Type: "pong"}
 	case "cancel":
 		registry.cancel(msg.TaskID)
+	case "stdin":
+		if err := registry.writeStdin(msg.TaskID, []byte(msg.StdinData)); err != nil {
+			// Non-fatal: task may have already exited.
+		}
 	case "task":
 		timeoutSecs := msg.Timeout
 		if timeoutSecs <= 0 {
