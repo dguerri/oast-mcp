@@ -17,6 +17,7 @@
 package agent
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
@@ -51,6 +52,8 @@ type inMsg struct {
 	Ok           bool           `json:"ok,omitempty"`
 	Data         map[string]any `json:"data,omitempty"`
 	Error        string         `json:"error,omitempty"`
+	Stdout       string         `json:"stdout,omitempty"`
+	Stderr       string         `json:"stderr,omitempty"`
 }
 
 type outMsg struct {
@@ -60,6 +63,7 @@ type outMsg struct {
 	Params     map[string]any `json:"params,omitempty"`
 	Timeout    int            `json:"timeout,omitempty"` // seconds; 0 means use agent default
 	Message    string         `json:"message,omitempty"`
+	Data       string         `json:"data,omitempty"`
 }
 
 // Server manages WebSocket connections from agents.
@@ -85,6 +89,82 @@ type agentConn struct {
 	tenantID string
 	ws       *websocket.Conn
 	send     chan outMsg
+
+	bufMu sync.Mutex
+	bufs  map[string]*interactiveBuf // task_id → buffer
+}
+
+// interactiveBuf accumulates stdout/stderr from an interactive_exec task.
+type interactiveBuf struct {
+	mu       sync.Mutex
+	cond     *sync.Cond
+	stdout   bytes.Buffer
+	stderr   bytes.Buffer
+	done     bool
+	exitCode *int
+	err      string
+}
+
+func newInteractiveBuf() *interactiveBuf {
+	b := &interactiveBuf{}
+	b.cond = sync.NewCond(&b.mu)
+	return b
+}
+
+func (b *interactiveBuf) Append(stdout, stderr string) {
+	b.mu.Lock()
+	if stdout != "" {
+		b.stdout.WriteString(stdout)
+	}
+	if stderr != "" {
+		b.stderr.WriteString(stderr)
+	}
+	b.mu.Unlock()
+	b.cond.Broadcast()
+}
+
+func (b *interactiveBuf) Finish(exitCode int, errMsg string) {
+	b.mu.Lock()
+	b.done = true
+	b.exitCode = &exitCode
+	b.err = errMsg
+	b.mu.Unlock()
+	b.cond.Broadcast()
+}
+
+// Drain returns accumulated stdout/stderr and clears the buffers.
+// If wait is true and buffers are empty and not done, blocks until data
+// arrives or deadline expires.
+func (b *interactiveBuf) Drain(wait bool, deadline time.Time) (stdout, stderr string, done bool, exitCode *int, errMsg string) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+
+	if wait {
+		for b.stdout.Len() == 0 && b.stderr.Len() == 0 && !b.done {
+			if !time.Now().Before(deadline) {
+				break
+			}
+			// Wake up periodically or when signaled
+			ch := make(chan struct{})
+			go func() {
+				timer := time.NewTimer(time.Until(deadline))
+				defer timer.Stop()
+				select {
+				case <-timer.C:
+					b.cond.Broadcast()
+				case <-ch:
+				}
+			}()
+			b.cond.Wait()
+			close(ch)
+		}
+	}
+
+	stdout = b.stdout.String()
+	stderr = b.stderr.String()
+	b.stdout.Reset()
+	b.stderr.Reset()
+	return stdout, stderr, b.done, b.exitCode, b.err
 }
 
 // NewServer creates an agent WebSocket server backed by the given auth, store, and binary directory.
@@ -287,7 +367,7 @@ func (s *Server) handleConn(ctx context.Context, ws *websocket.Conn) {
 		return
 	}
 
-	conn := &agentConn{agentID: agentID, tenantID: claims.TenantID, ws: ws, send: make(chan outMsg, 16)}
+	conn := &agentConn{agentID: agentID, tenantID: claims.TenantID, ws: ws, send: make(chan outMsg, 16), bufs: make(map[string]*interactiveBuf)}
 	s.mu.Lock()
 	s.conns[connKey(claims.TenantID, agentID)] = conn
 	s.mu.Unlock()
@@ -301,6 +381,12 @@ func (s *Server) handleConn(ctx context.Context, ws *websocket.Conn) {
 		if err := s.store.UpdateAgentStatus(cleanupCtx, agentID, conn.tenantID, "offline", time.Now().UTC()); err != nil {
 			s.logger.Warn("failed to mark agent offline", "agent_id", agentID, "err", err)
 		}
+		// Clean up interactive buffers — mark any running ones as done.
+		conn.bufMu.Lock()
+		for _, buf := range conn.bufs {
+			buf.Finish(0, "agent disconnected")
+		}
+		conn.bufMu.Unlock()
 	}()
 
 	ctx, cancel := context.WithCancel(ctx)
@@ -341,6 +427,12 @@ func (s *Server) dispatchLoop(ctx context.Context, conn *agentConn) {
 				Capability: task.Capability,
 				Params:     task.Params,
 				Timeout:    timeoutSecs,
+			}
+			if task.Capability == CapInteractiveExec {
+				buf := newInteractiveBuf()
+				conn.bufMu.Lock()
+				conn.bufs[task.TaskID] = buf
+				conn.bufMu.Unlock()
 			}
 		}
 	}
@@ -397,6 +489,13 @@ func (s *Server) readLoop(ctx context.Context, conn *agentConn) {
 			if err := s.store.UpdateAgentStatus(ctx, conn.agentID, conn.tenantID, "online", now); err != nil {
 				s.logger.Warn("failed to update last_seen_at", "agent_id", conn.agentID, "err", err)
 			}
+		case "stream":
+			conn.bufMu.Lock()
+			buf, ok := conn.bufs[msg.TaskID]
+			conn.bufMu.Unlock()
+			if ok {
+				buf.Append(msg.Stdout, msg.Stderr)
+			}
 		case "result":
 			s.handleResult(ctx, conn, msg)
 		default:
@@ -423,4 +522,51 @@ func (s *Server) handleResult(ctx context.Context, conn *agentConn, msg inMsg) {
 	if err := s.store.UpdateTask(ctx, task); err != nil {
 		s.logger.Error("update task", "taskID", msg.TaskID, "err", err)
 	}
+
+	// If this was an interactive task, finish its buffer.
+	conn.bufMu.Lock()
+	buf, ok := conn.bufs[msg.TaskID]
+	conn.bufMu.Unlock()
+	if ok {
+		exitCode := 0
+		errMsg := ""
+		if msg.Ok {
+			if ec, ecOk := msg.Data["exit_code"].(float64); ecOk {
+				exitCode = int(ec)
+			}
+		} else {
+			errMsg = msg.Error
+		}
+		buf.Finish(exitCode, errMsg)
+	}
+}
+
+// SendStdin sends a stdin message to the agent for the given interactive task.
+func (s *Server) SendStdin(taskID, agentID, tenantID, data string) error {
+	s.mu.RLock()
+	conn, ok := s.conns[connKey(tenantID, agentID)]
+	s.mu.RUnlock()
+	if !ok {
+		return fmt.Errorf("agent not connected")
+	}
+	select {
+	case conn.send <- outMsg{Type: "stdin", TaskID: taskID, Data: data}:
+		return nil
+	default:
+		return fmt.Errorf("send buffer full")
+	}
+}
+
+// GetInteractiveBuf returns the interactive buffer for a task, or nil.
+func (s *Server) GetInteractiveBuf(taskID, agentID, tenantID string) *interactiveBuf {
+	s.mu.RLock()
+	conn, ok := s.conns[connKey(tenantID, agentID)]
+	s.mu.RUnlock()
+	if !ok {
+		return nil
+	}
+	conn.bufMu.Lock()
+	buf := conn.bufs[taskID]
+	conn.bufMu.Unlock()
+	return buf
 }
