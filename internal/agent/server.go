@@ -91,11 +91,11 @@ type agentConn struct {
 	send     chan outMsg
 
 	bufMu sync.Mutex
-	bufs  map[string]*interactiveBuf // task_id → buffer
+	bufs  map[string]*InteractiveBuf // task_id → buffer
 }
 
-// interactiveBuf accumulates stdout/stderr from an interactive_exec task.
-type interactiveBuf struct {
+// InteractiveBuf accumulates stdout/stderr from an interactive_exec task.
+type InteractiveBuf struct {
 	mu       sync.Mutex
 	cond     *sync.Cond
 	stdout   bytes.Buffer
@@ -105,13 +105,14 @@ type interactiveBuf struct {
 	err      string
 }
 
-func newInteractiveBuf() *interactiveBuf {
-	b := &interactiveBuf{}
+// NewInteractiveBuf creates a new InteractiveBuf with its condition variable initialized.
+func NewInteractiveBuf() *InteractiveBuf {
+	b := &InteractiveBuf{}
 	b.cond = sync.NewCond(&b.mu)
 	return b
 }
 
-func (b *interactiveBuf) Append(stdout, stderr string) {
+func (b *InteractiveBuf) Append(stdout, stderr string) {
 	b.mu.Lock()
 	if stdout != "" {
 		b.stdout.WriteString(stdout)
@@ -123,7 +124,7 @@ func (b *interactiveBuf) Append(stdout, stderr string) {
 	b.cond.Broadcast()
 }
 
-func (b *interactiveBuf) Finish(exitCode int, errMsg string) {
+func (b *InteractiveBuf) Finish(exitCode int, errMsg string) {
 	b.mu.Lock()
 	b.done = true
 	b.exitCode = &exitCode
@@ -135,7 +136,7 @@ func (b *interactiveBuf) Finish(exitCode int, errMsg string) {
 // Drain returns accumulated stdout/stderr and clears the buffers.
 // If wait is true and buffers are empty and not done, blocks until data
 // arrives or deadline expires.
-func (b *interactiveBuf) Drain(wait bool, deadline time.Time) (stdout, stderr string, done bool, exitCode *int, errMsg string) {
+func (b *InteractiveBuf) Drain(wait bool, deadline time.Time) (stdout, stderr string, done bool, exitCode *int, errMsg string) {
 	b.mu.Lock()
 	defer b.mu.Unlock()
 
@@ -367,7 +368,7 @@ func (s *Server) handleConn(ctx context.Context, ws *websocket.Conn) {
 		return
 	}
 
-	conn := &agentConn{agentID: agentID, tenantID: claims.TenantID, ws: ws, send: make(chan outMsg, 16), bufs: make(map[string]*interactiveBuf)}
+	conn := &agentConn{agentID: agentID, tenantID: claims.TenantID, ws: ws, send: make(chan outMsg, 16), bufs: make(map[string]*InteractiveBuf)}
 	s.mu.Lock()
 	s.conns[connKey(claims.TenantID, agentID)] = conn
 	s.mu.Unlock()
@@ -429,7 +430,7 @@ func (s *Server) dispatchLoop(ctx context.Context, conn *agentConn) {
 				Timeout:    timeoutSecs,
 			}
 			if task.Capability == CapInteractiveExec {
-				buf := newInteractiveBuf()
+				buf := NewInteractiveBuf()
 				conn.bufMu.Lock()
 				conn.bufs[task.TaskID] = buf
 				conn.bufMu.Unlock()
@@ -558,7 +559,7 @@ func (s *Server) SendStdin(taskID, agentID, tenantID, data string) error {
 }
 
 // GetInteractiveBuf returns the interactive buffer for a task, or nil.
-func (s *Server) GetInteractiveBuf(taskID, agentID, tenantID string) *interactiveBuf {
+func (s *Server) GetInteractiveBuf(taskID, agentID, tenantID string) *InteractiveBuf {
 	s.mu.RLock()
 	conn, ok := s.conns[connKey(tenantID, agentID)]
 	s.mu.RUnlock()

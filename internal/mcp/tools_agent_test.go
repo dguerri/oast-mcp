@@ -996,3 +996,105 @@ func TestAgentTaskCancel_NotFound(t *testing.T) {
 	require.True(t, result.IsError)
 	assert.Contains(t, getResultText(t, result), "task not found")
 }
+
+// TestAgentTaskInteract_NonInteractiveTask verifies that calling
+// agent_task_interact on a non-interactive (exec) task returns an error.
+func TestAgentTaskInteract_NonInteractiveTask(t *testing.T) {
+	srv, a, st, _ := newTestServer(t)
+
+	now := time.Now().UTC()
+	require.NoError(t, st.UpsertAgent(context.Background(), &store.Agent{
+		AgentID: "agent-ni", TenantID: "alice", Name: "Agent NI",
+		RegisteredAt: now, Capabilities: []string{"exec"}, Status: "online",
+	}))
+	require.NoError(t, st.EnqueueTask(context.Background(), &store.Task{
+		TaskID: "task-ni-1", AgentID: "agent-ni", TenantID: "alice",
+		Capability: "exec", Params: map[string]any{"cmd": "id"},
+		Status: "pending", CreatedAt: now,
+	}))
+
+	ctx := makeCtx(t, a, "alice", []string{"agent:admin"})
+	result, err := srv.CallTool(ctx, "agent_task_interact", map[string]any{
+		"task_id": "task-ni-1",
+	})
+	require.NoError(t, err)
+	require.True(t, result.IsError)
+	assert.Contains(t, getResultText(t, result), "not interactive")
+}
+
+// TestAgentTaskInteract_MissingTaskID verifies that omitting task_id returns
+// an error.
+func TestAgentTaskInteract_MissingTaskID(t *testing.T) {
+	srv, a, _, _ := newTestServer(t)
+	ctx := makeCtx(t, a, "alice", []string{"agent:admin"})
+
+	result, err := srv.CallTool(ctx, "agent_task_interact", map[string]any{})
+	require.NoError(t, err)
+	require.True(t, result.IsError)
+	assert.Contains(t, getResultText(t, result), "task_id")
+}
+
+// TestAgentTaskInteract_InsufficientScope verifies that a token without
+// agent:admin is rejected.
+func TestAgentTaskInteract_InsufficientScope(t *testing.T) {
+	srv, a, _, _ := newTestServer(t)
+	ctx := makeCtx(t, a, "alice", []string{"oast:read"})
+
+	result, err := srv.CallTool(ctx, "agent_task_interact", map[string]any{
+		"task_id": "some-task",
+	})
+	require.NoError(t, err)
+	require.True(t, result.IsError)
+	assert.Contains(t, getResultText(t, result), "agent:admin")
+}
+
+// TestAgentTaskSchedule_WriteFile verifies that a write_file task can be
+// scheduled for an agent with the write_file capability.
+func TestAgentTaskSchedule_WriteFile(t *testing.T) {
+	srv, a, st, _ := newTestServer(t)
+
+	now := time.Now().UTC()
+	require.NoError(t, st.UpsertAgent(context.Background(), &store.Agent{
+		AgentID: "agent-wf", TenantID: "alice", Name: "WF Agent",
+		RegisteredAt: now, Capabilities: []string{"write_file"}, Status: "online",
+	}))
+
+	ctx := makeCtx(t, a, "alice", []string{"agent:admin"})
+	result, err := srv.CallTool(ctx, "agent_task_schedule", map[string]any{
+		"agent_id":   "agent-wf",
+		"capability": "write_file",
+		"params":     map[string]any{"path": "/tmp/test.txt", "content_b64": "aGVsbG8="},
+	})
+	require.NoError(t, err)
+	require.False(t, result.IsError, getResultText(t, result))
+
+	taskID := extractField(t, result, "task_id")
+	task, err := st.GetTask(context.Background(), taskID, "alice")
+	require.NoError(t, err)
+	assert.Equal(t, "write_file", task.Capability)
+}
+
+// TestAgentTaskInteract_WrongTenant verifies that bob cannot interact with
+// alice's interactive task.
+func TestAgentTaskInteract_WrongTenant(t *testing.T) {
+	srv, a, st, _ := newTestServer(t)
+
+	now := time.Now().UTC()
+	require.NoError(t, st.UpsertAgent(context.Background(), &store.Agent{
+		AgentID: "agent-it", TenantID: "alice", Name: "IT Agent",
+		RegisteredAt: now, Capabilities: []string{"interactive_exec"}, Status: "online",
+	}))
+	require.NoError(t, st.EnqueueTask(context.Background(), &store.Task{
+		TaskID: "task-it-1", AgentID: "agent-it", TenantID: "alice",
+		Capability: "interactive_exec", Params: map[string]any{"command": "cat"},
+		Status: "running", CreatedAt: now,
+	}))
+
+	bobCtx := makeCtx(t, a, "bob", []string{"agent:admin"})
+	result, err := srv.CallTool(bobCtx, "agent_task_interact", map[string]any{
+		"task_id": "task-it-1",
+	})
+	require.NoError(t, err)
+	require.True(t, result.IsError)
+	assert.Contains(t, getResultText(t, result), "task not found")
+}

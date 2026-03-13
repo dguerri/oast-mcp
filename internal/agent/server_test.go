@@ -598,3 +598,179 @@ func TestDownloadSecondStage_ValidToken_BinaryPresent(t *testing.T) {
 	defer func() { _ = resp.Body.Close() }()
 	assert.Equal(t, http.StatusOK, resp.StatusCode)
 }
+
+// TestInteractiveExec_StreamAndResult_E2E verifies that an interactive_exec task
+// dispatches to the agent, stream messages buffer output, and the result message
+// marks the buffer as done with an exit code.
+func TestInteractiveExec_StreamAndResult_E2E(t *testing.T) {
+	srv, a, st := setupServer(t)
+
+	token, err := a.IssueAgent("alice", "agent-iexec", []string{"agent:connect"}, time.Hour)
+	require.NoError(t, err)
+
+	conn, _ := connectAgent(t, srv, token, "agent-iexec",
+		[]string{"exec", "interactive_exec"})
+
+	require.Eventually(t, func() bool {
+		ag, err := st.GetAgent(context.Background(), "agent-iexec", "alice")
+		return err == nil && ag != nil
+	}, 2*time.Second, 50*time.Millisecond)
+
+	now := time.Now().UTC()
+	timeoutAt := now.Add(10 * time.Minute)
+	task := &store.Task{
+		TaskID:      "task-iexec-1",
+		AgentID:     "agent-iexec",
+		TenantID:    "alice",
+		Capability:  "interactive_exec",
+		Params:      map[string]any{"command": "cat", "binary": false},
+		Status:      "pending",
+		CreatedAt:   now,
+		TimeoutSecs: 600,
+		TimeoutAt:   &timeoutAt,
+	}
+	require.NoError(t, st.EnqueueTask(context.Background(), task))
+
+	// Wait for dispatch.
+	require.NoError(t, conn.SetReadDeadline(time.Now().Add(5*time.Second)))
+	taskMsg := readNonPing(t, conn)
+	assert.Equal(t, "task", taskMsg["type"])
+	assert.Equal(t, "task-iexec-1", taskMsg["task_id"])
+	assert.Equal(t, "interactive_exec", taskMsg["capability"])
+
+	// Agent sends stream output.
+	require.NoError(t, conn.WriteJSON(map[string]any{
+		"type":    "stream",
+		"task_id": "task-iexec-1",
+		"stdout":  "hello> ",
+	}))
+
+	// Verify buffer has data via GetInteractiveBuf.
+	var buf *agent.InteractiveBuf
+	require.Eventually(t, func() bool {
+		buf = srv.GetInteractiveBuf("task-iexec-1", "agent-iexec", "alice")
+		return buf != nil
+	}, 2*time.Second, 50*time.Millisecond, "interactive buffer should exist")
+
+	// Give the stream message time to be processed.
+	time.Sleep(100 * time.Millisecond)
+
+	stdout, stderr, done, _, _ := buf.Drain(false, time.Time{})
+	assert.Equal(t, "hello> ", stdout)
+	assert.Empty(t, stderr)
+	assert.False(t, done)
+
+	// Agent sends result (process exited).
+	require.NoError(t, conn.WriteJSON(map[string]any{
+		"type":    "result",
+		"task_id": "task-iexec-1",
+		"ok":      true,
+		"data":    map[string]any{"exit_code": float64(0)},
+	}))
+
+	require.Eventually(t, func() bool {
+		t2, err := st.GetTask(context.Background(), "task-iexec-1", "alice")
+		return err == nil && t2.Status == "done"
+	}, 2*time.Second, 50*time.Millisecond, "task should be marked done")
+
+	// Buffer should now be finished.
+	_, _, done, exitCode, _ := buf.Drain(false, time.Time{})
+	assert.True(t, done)
+	require.NotNil(t, exitCode)
+	assert.Equal(t, 0, *exitCode)
+}
+
+// TestInteractiveExec_StdinForwarded verifies that SendStdin delivers a stdin
+// message to the connected agent over the WebSocket.
+func TestInteractiveExec_StdinForwarded(t *testing.T) {
+	srv, a, st := setupServer(t)
+
+	token, err := a.IssueAgent("alice", "agent-stdin", []string{"agent:connect"}, time.Hour)
+	require.NoError(t, err)
+
+	conn, _ := connectAgent(t, srv, token, "agent-stdin",
+		[]string{"exec", "interactive_exec"})
+
+	require.Eventually(t, func() bool {
+		ag, err := st.GetAgent(context.Background(), "agent-stdin", "alice")
+		return err == nil && ag != nil
+	}, 2*time.Second, 50*time.Millisecond)
+
+	now := time.Now().UTC()
+	timeoutAt := now.Add(10 * time.Minute)
+	task := &store.Task{
+		TaskID:      "task-stdin-1",
+		AgentID:     "agent-stdin",
+		TenantID:    "alice",
+		Capability:  "interactive_exec",
+		Params:      map[string]any{"command": "cat"},
+		Status:      "pending",
+		CreatedAt:   now,
+		TimeoutSecs: 600,
+		TimeoutAt:   &timeoutAt,
+	}
+	require.NoError(t, st.EnqueueTask(context.Background(), task))
+
+	// Wait for dispatch.
+	require.NoError(t, conn.SetReadDeadline(time.Now().Add(5*time.Second)))
+	_ = readNonPing(t, conn)
+
+	// Send stdin via server.
+	require.NoError(t, srv.SendStdin("task-stdin-1", "agent-stdin", "alice", "hello\n"))
+
+	// Agent should receive the stdin message.
+	msg := readNonPing(t, conn)
+	assert.Equal(t, "stdin", msg["type"])
+	assert.Equal(t, "task-stdin-1", msg["task_id"])
+	assert.Equal(t, "hello\n", msg["data"])
+}
+
+// TestInteractiveExec_DisconnectFinishesBuffer verifies that when an agent
+// disconnects, any active interactive buffers are marked as done with an
+// "agent disconnected" error.
+func TestInteractiveExec_DisconnectFinishesBuffer(t *testing.T) {
+	srv, a, st := setupServer(t)
+
+	token, err := a.IssueAgent("alice", "agent-dc", []string{"agent:connect"}, time.Hour)
+	require.NoError(t, err)
+
+	conn, _ := connectAgent(t, srv, token, "agent-dc",
+		[]string{"exec", "interactive_exec"})
+
+	require.Eventually(t, func() bool {
+		ag, err := st.GetAgent(context.Background(), "agent-dc", "alice")
+		return err == nil && ag != nil
+	}, 2*time.Second, 50*time.Millisecond)
+
+	now := time.Now().UTC()
+	timeoutAt := now.Add(10 * time.Minute)
+	require.NoError(t, st.EnqueueTask(context.Background(), &store.Task{
+		TaskID: "task-dc-1", AgentID: "agent-dc", TenantID: "alice",
+		Capability: "interactive_exec", Params: map[string]any{"command": "cat"},
+		Status: "pending", CreatedAt: now, TimeoutSecs: 600, TimeoutAt: &timeoutAt,
+	}))
+
+	require.NoError(t, conn.SetReadDeadline(time.Now().Add(5*time.Second)))
+	_ = readNonPing(t, conn) // consume task dispatch
+
+	var buf *agent.InteractiveBuf
+	require.Eventually(t, func() bool {
+		buf = srv.GetInteractiveBuf("task-dc-1", "agent-dc", "alice")
+		return buf != nil
+	}, 2*time.Second, 50*time.Millisecond)
+
+	// Disconnect the agent.
+	require.NoError(t, conn.WriteMessage(
+		websocket.CloseMessage,
+		websocket.FormatCloseMessage(websocket.CloseNormalClosure, ""),
+	))
+
+	// Buffer should be marked done with "agent disconnected" error.
+	require.Eventually(t, func() bool {
+		_, _, done, _, _ := buf.Drain(false, time.Time{})
+		return done
+	}, 3*time.Second, 50*time.Millisecond, "buffer should be finished after disconnect")
+
+	_, _, _, _, errMsg := buf.Drain(false, time.Time{})
+	assert.Equal(t, "agent disconnected", errMsg)
+}
