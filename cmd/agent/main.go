@@ -28,6 +28,7 @@ import (
 	"net/url"
 	"os"
 	"runtime"
+	"strconv"
 	"sync"
 	"time"
 
@@ -109,7 +110,7 @@ func runOnce() error {
 		"type":         "register",
 		"agent_id":     *agentID,
 		"token":        *token,
-		"capabilities": []string{"exec", "read_file", "fetch_url", "system_info"},
+		"capabilities": agent.AllCapabilities,
 		"insecure":     *insecure,
 	})
 	if err := conn.WriteMessage(websocket.TextMessage, reg); err != nil {
@@ -225,6 +226,38 @@ func handleTask(ctx context.Context, msg inMsg) outMsg {
 			execErr = err.Error()
 		} else {
 			data = map[string]any{"content": base64.StdEncoding.EncodeToString(b), "path": path}
+		}
+
+	case agent.CapWriteFile:
+		path, _ := params["path"].(string)
+		contentB64, _ := params["content_b64"].(string)
+		modeStr, _ := params["mode"].(string)
+		if path == "" {
+			execErr = "path is required"
+			break
+		}
+		if contentB64 == "" {
+			execErr = "content_b64 is required"
+			break
+		}
+		decoded, err := base64.StdEncoding.DecodeString(contentB64)
+		if err != nil {
+			execErr = "invalid base64: " + err.Error()
+			break
+		}
+		var perm os.FileMode = 0644
+		if modeStr != "" {
+			parsed, err := strconv.ParseUint(modeStr, 8, 32)
+			if err != nil {
+				execErr = "invalid mode: " + err.Error()
+				break
+			}
+			perm = os.FileMode(parsed)
+		}
+		if err := os.WriteFile(path, decoded, perm); err != nil {
+			execErr = err.Error()
+		} else {
+			data = map[string]any{"bytes_written": len(decoded)}
 		}
 
 	case agent.CapFetchURL:
