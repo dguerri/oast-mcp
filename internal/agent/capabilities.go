@@ -15,13 +15,16 @@
 package agent
 
 const (
-	CapExec       = "exec"
-	CapReadFile   = "read_file"
-	CapFetchURL   = "fetch_url"
-	CapSystemInfo = "system_info"
+	CapExec            = "exec"
+	CapReadFile        = "read_file"
+	CapFetchURL        = "fetch_url"
+	CapSystemInfo      = "system_info"
+	CapWriteFile       = "write_file"
+	CapInteractiveExec = "interactive_exec"
 )
 
 // AllCapabilities lists every capability string understood by the agent.
 var AllCapabilities = []string{
 	CapExec, CapReadFile, CapFetchURL, CapSystemInfo,
+	CapWriteFile, CapInteractiveExec,
 }
