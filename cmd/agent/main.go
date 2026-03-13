@@ -226,12 +226,28 @@ func dispatchMessage(msg inMsg, results chan outMsg, registry *taskRegistry) err
 			context.Background(),
 			time.Duration(timeoutSecs)*time.Second,
 		)
-		registry.register(msg.TaskID, cancelFn)
-		go func(m inMsg, ctx context.Context, cancel context.CancelFunc) {
-			defer cancel()
-			defer registry.remove(m.TaskID)
-			results <- handleTask(ctx, m)
-		}(msg, ctx, cancelFn)
+
+		if msg.Capability == agent.CapInteractiveExec {
+			command, _ := msg.Params["command"].(string)
+			binary, _ := msg.Params["binary"].(bool)
+			stdinW := runInteractive(ctx, msg.TaskID, command, binary, results)
+			registry.registerInteractive(msg.TaskID, cancelFn, stdinW)
+			// runInteractive sets up its own goroutines and sends the
+			// final "result" message when the process exits.
+			// Clean up after context expires.
+			go func(taskID string, cancel context.CancelFunc) {
+				<-ctx.Done()
+				cancel()
+				registry.remove(taskID)
+			}(msg.TaskID, cancelFn)
+		} else {
+			registry.register(msg.TaskID, cancelFn)
+			go func(m inMsg, ctx context.Context, cancel context.CancelFunc) {
+				defer cancel()
+				defer registry.remove(m.TaskID)
+				results <- handleTask(ctx, m)
+			}(msg, ctx, cancelFn)
+		}
 	}
 	return nil
 }
