@@ -44,16 +44,19 @@ func (s *Server) registerAgentTools() {
 	scheduleTool := mcpgo.NewTool("agent_task_schedule",
 		mcpgo.WithDescription("Schedule a task for an agent. Tasks are async — poll agent_task_status until status is 'done' or 'error'.\n\n"+
 			"Available capabilities and their params:\n"+
-			"  exec        — run a shell command. params: {\"cmd\": \"<shell command>\"}\n"+
-			"  read_file   — read a file and return base64-encoded content. params: {\"path\": \"<absolute path>\"}\n"+
-			"  fetch_url   — make an HTTP GET request. params: {\"url\": \"<url>\"}\n"+
-			"  system_info — return hostname, OS, arch, current user. params: {} (none required)\n\n"+
+			"  exec             — run a shell command. params: {\"cmd\": \"<shell command>\"}\n"+
+			"  interactive_exec — start an interactive process (PTY on Unix). params: {\"command\": \"<shell command>\", \"binary\": false}\n"+
+			"                     Use agent_task_interact to send stdin and read stdout/stderr.\n"+
+			"  read_file        — read a file and return base64-encoded content. params: {\"path\": \"<absolute path>\"}\n"+
+			"  write_file       — write a file from base64-encoded content. params: {\"path\": \"<absolute path>\", \"content_b64\": \"<base64 data>\", \"mode\": \"0644\"}\n"+
+			"  fetch_url        — make an HTTP GET request. params: {\"url\": \"<url>\"}\n"+
+			"  system_info      — return hostname, OS, arch, current user. params: {} (none required)\n\n"+
 			"The timeout_secs parameter controls the overall task deadline (default 600 s = 10 min). "+
 			"The agent enforces this deadline locally, killing any subprocess when it fires. "+
 			"Use agent_task_cancel to abort a pending or running task early.\n\n"+
 			"The returned task_id is used to poll agent_task_status for the result."),
 		mcpgo.WithString("agent_id", mcpgo.Required(), mcpgo.Description("The agent ID to schedule the task for")),
-		mcpgo.WithString("capability", mcpgo.Required(), mcpgo.Description("One of: exec, read_file, fetch_url, system_info")),
+		mcpgo.WithString("capability", mcpgo.Required(), mcpgo.Description("One of: exec, interactive_exec, read_file, write_file, fetch_url, system_info")),
 		mcpgo.WithObject("params", mcpgo.Description("Parameters for the capability (see tool description for schema per capability)")),
 		mcpgo.WithNumber("timeout_secs", mcpgo.Description(fmt.Sprintf(
 			"Task execution timeout in seconds (default %d, max 86400). "+
@@ -96,10 +99,37 @@ func (s *Server) registerAgentTools() {
 		mcpgo.WithString("agent_id", mcpgo.Required(), mcpgo.Description("The agent ID that owns the task (needed to route the cancel signal)")),
 	)
 
+	interactTool := mcpgo.NewTool("agent_task_interact",
+		mcpgo.WithDescription(
+			"Send input to and read output from a running interactive_exec task.\n\n"+
+				"When an interactive_exec task is scheduled, the agent starts the process under a PTY "+
+				"(Unix) or pipes (Windows). Use this tool to exchange data with the running process.\n\n"+
+				"Workflow:\n"+
+				"  1. Schedule: agent_task_schedule(capability=\"interactive_exec\", params={\"command\": \"...\"})\n"+
+				"  2. Read initial output: agent_task_interact(task_id=...) — no stdin, just drain startup output\n"+
+				"  3. Send input + read response: agent_task_interact(task_id=..., stdin=\"yes\\n\")\n"+
+				"  4. Repeat until the process exits (running=false in the response)\n\n"+
+				"stdin is written to the process verbatim (include \\n for newlines).\n"+
+				"By default, stdout/stderr are returned as UTF-8 text. Set binary=true to use "+
+				"base64 encoding for both directions (e.g. when the process emits raw binary).\n\n"+
+				"If wait=true (default) and no output is available yet, the call blocks server-side "+
+				"until output arrives or timeout_secs elapses — no polling loop needed.\n\n"+
+				"Returns {stdout, stderr, running, exit_code}. exit_code is present only when running=false."),
+		mcpgo.WithString("task_id", mcpgo.Required(), mcpgo.Description("The task ID of the interactive_exec task")),
+		mcpgo.WithString("stdin", mcpgo.Description("Data to write to the process stdin (include \\n for newlines)")),
+		mcpgo.WithBoolean("binary", mcpgo.Description(
+			"When true, stdin is expected as base64 and stdout/stderr are returned as base64 (default: false)")),
+		mcpgo.WithBoolean("wait", mcpgo.Description(
+			"Block until output is available or timeout elapses (default: true)")),
+		mcpgo.WithNumber("timeout_secs", mcpgo.Description(
+			"Wait timeout in seconds (default 30, max 120). Only applies when wait=true.")),
+	)
+
 	s.mcp.AddTool(listTool, s.handleAgentList)
 	s.mcp.AddTool(scheduleTool, s.handleAgentTaskSchedule)
 	s.mcp.AddTool(statusTool, s.handleAgentTaskStatus)
 	s.mcp.AddTool(cancelTool, s.handleAgentTaskCancel)
+	s.mcp.AddTool(interactTool, s.handleAgentTaskInteract)
 
 	targets := scanLoaderTargets(s.binDir)
 	targetList := strings.Join(targets, ", ")
@@ -161,6 +191,7 @@ func (s *Server) agentHandlers() map[string]mcpserver.ToolHandlerFunc {
 		"agent_task_schedule":    s.handleAgentTaskSchedule,
 		"agent_task_status":      s.handleAgentTaskStatus,
 		"agent_task_cancel":      s.handleAgentTaskCancel,
+		"agent_task_interact":    s.handleAgentTaskInteract,
 		"agent_dropper_generate": s.handleAgentDropperGenerate,
 	}
 }
@@ -362,6 +393,88 @@ func (s *Server) handleAgentTaskCancel(ctx context.Context, req mcpgo.CallToolRe
 		"agent_id": agentID,
 		"status":   "cancelled",
 	})
+}
+
+// handleAgentTaskInteract handles the agent_task_interact tool call.
+func (s *Server) handleAgentTaskInteract(ctx context.Context, req mcpgo.CallToolRequest) (*mcpgo.CallToolResult, error) {
+	claims, ok := claimsFromCtx(ctx)
+	if !ok {
+		return toolError("unauthorized")
+	}
+	if err := auth.RequireScope(claims, "agent:admin"); err != nil {
+		s.audit.Log(s.newAuditEvent(ctx, "agent.task.interact", "denied"))
+		return toolError("insufficient scope: agent:admin required")
+	}
+	if !s.rl.Allow(claims.TenantID) {
+		return toolError("rate limit exceeded")
+	}
+
+	taskID := req.GetString("task_id", "")
+	if taskID == "" {
+		return toolError("task_id is required")
+	}
+
+	task, err := s.store.GetTask(ctx, taskID, claims.TenantID)
+	if err != nil {
+		if errors.Is(err, store.ErrNotFound) {
+			return toolError("task not found")
+		}
+		s.logger.Error("failed to get task", "error", err)
+		return toolError("failed to get task")
+	}
+
+	if task.Capability != "interactive_exec" {
+		return toolError("task is not interactive — use agent_task_status instead")
+	}
+
+	if s.agentSrv == nil {
+		return toolError("agent server not configured")
+	}
+
+	// Send stdin if provided.
+	stdinData := req.GetString("stdin", "")
+	if stdinData != "" {
+		if err := s.agentSrv.SendStdin(taskID, task.AgentID, claims.TenantID, stdinData); err != nil {
+			return toolError("failed to send stdin: " + err.Error())
+		}
+	}
+
+	// Get the interactive buffer.
+	buf := s.agentSrv.GetInteractiveBuf(taskID, task.AgentID, claims.TenantID)
+	if buf == nil {
+		// Task may have already completed or agent disconnected.
+		if isTerminalStatus(task.Status) {
+			return toolJSON(map[string]any{
+				"stdout":  "",
+				"stderr":  "",
+				"running": false,
+				"error":   task.Err,
+			})
+		}
+		return toolError("interactive buffer not found — agent may have disconnected")
+	}
+
+	wait, waitTimeout := parseWaitParams(req)
+	deadline := time.Now().Add(time.Duration(waitTimeout) * time.Second)
+
+	stdout, stderr, done, exitCode, errMsg := buf.Drain(wait, deadline)
+
+	ev := s.newAuditEvent(ctx, "agent.task.interact", "ok")
+	ev.Resource = taskID
+	s.audit.Log(ev)
+
+	resp := map[string]any{
+		"stdout":  stdout,
+		"stderr":  stderr,
+		"running": !done,
+	}
+	if done && exitCode != nil {
+		resp["exit_code"] = *exitCode
+	}
+	if done && errMsg != "" {
+		resp["error"] = errMsg
+	}
+	return toolJSON(resp)
 }
 
 const (
