@@ -17,6 +17,7 @@ VM_DISK_SIZE_GB ?= 20
 VM_IMAGE        ?= debian-cloud/debian-12
 
 .PHONY: build test lint cover cross clean build-loader-c build-loaders build-agents build-all
+.PHONY: smoke
 .PHONY: secrets tf-generate tf-init tf-apply inventory ansible deploy teardown
 
 COVER_THRESHOLD ?= 60
@@ -75,6 +76,10 @@ build-all: build build-loaders build-agents
 
 test:
 	go test ./... -race -count=1 -timeout=60s
+
+smoke: ## Run Docker smoke tests
+	docker build -f test/smoke/Dockerfile -t oast-mcp-smoke .
+	docker run --rm --privileged oast-mcp-smoke
 
 cover:
 	go test ./internal/... -race -count=1 -timeout=60s -coverprofile=coverage.out -covermode=atomic -coverpkg=./internal/...
