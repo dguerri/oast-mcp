@@ -214,9 +214,8 @@ func dispatchMessage(msg inMsg, results chan outMsg, registry *taskRegistry) err
 	case "cancel":
 		registry.cancel(msg.TaskID)
 	case "stdin":
-		if err := registry.writeStdin(msg.TaskID, []byte(msg.StdinData)); err != nil {
-			// Non-fatal: task may have already exited.
-		}
+		// Non-fatal: task may have already exited.
+		_ = registry.writeStdin(msg.TaskID, []byte(msg.StdinData))
 	case "task":
 		timeoutSecs := msg.Timeout
 		if timeoutSecs <= 0 {
@@ -282,61 +281,10 @@ func handleTask(ctx context.Context, msg inMsg) outMsg {
 		}
 
 	case agent.CapWriteFile:
-		path, _ := params["path"].(string)
-		contentB64, _ := params["content_b64"].(string)
-		modeStr, _ := params["mode"].(string)
-		if path == "" {
-			execErr = "path is required"
-			break
-		}
-		if contentB64 == "" {
-			execErr = "content_b64 is required"
-			break
-		}
-		decoded, err := base64.StdEncoding.DecodeString(contentB64)
-		if err != nil {
-			execErr = "invalid base64: " + err.Error()
-			break
-		}
-		var perm os.FileMode = 0644
-		if modeStr != "" {
-			parsed, err := strconv.ParseUint(modeStr, 8, 32)
-			if err != nil {
-				execErr = "invalid mode: " + err.Error()
-				break
-			}
-			perm = os.FileMode(parsed)
-		}
-		if err := os.WriteFile(path, decoded, perm); err != nil {
-			execErr = err.Error()
-		} else {
-			data = map[string]any{"bytes_written": len(decoded)}
-		}
+		data, execErr = doWriteFile(params)
 
 	case agent.CapFetchURL:
-		rawURL, _ := params["url"].(string)
-		client := &http.Client{}
-		if *insecure {
-			client.Transport = &http.Transport{
-				TLSClientConfig: &tls.Config{InsecureSkipVerify: true}, //nolint:gosec
-			}
-		}
-		req, err := http.NewRequestWithContext(ctx, http.MethodGet, rawURL, nil)
-		if err != nil {
-			execErr = err.Error()
-			break
-		}
-		resp, err := client.Do(req)
-		if err != nil {
-			execErr = err.Error()
-		} else {
-			defer func() { _ = resp.Body.Close() }()
-			body, _ := io.ReadAll(resp.Body)
-			data = map[string]any{
-				"status": resp.StatusCode,
-				"body":   base64.StdEncoding.EncodeToString(body),
-			}
-		}
+		data, execErr = doFetchURL(ctx, params)
 
 	case agent.CapSystemInfo:
 		hostname, _ := os.Hostname()
@@ -355,6 +303,58 @@ func handleTask(ctx context.Context, msg inMsg) outMsg {
 		return outMsg{Type: "result", TaskID: tid, Ok: false, Error: execErr}
 	}
 	return outMsg{Type: "result", TaskID: tid, Ok: true, Data: data}
+}
+
+func doWriteFile(params map[string]any) (map[string]any, string) {
+	path, _ := params["path"].(string)
+	contentB64, _ := params["content_b64"].(string)
+	modeStr, _ := params["mode"].(string)
+	if path == "" {
+		return nil, "path is required"
+	}
+	if contentB64 == "" {
+		return nil, "content_b64 is required"
+	}
+	decoded, err := base64.StdEncoding.DecodeString(contentB64)
+	if err != nil {
+		return nil, "invalid base64: " + err.Error()
+	}
+	var perm os.FileMode = 0644
+	if modeStr != "" {
+		parsed, err := strconv.ParseUint(modeStr, 8, 32)
+		if err != nil {
+			return nil, "invalid mode: " + err.Error()
+		}
+		perm = os.FileMode(parsed)
+	}
+	if err := os.WriteFile(path, decoded, perm); err != nil {
+		return nil, err.Error()
+	}
+	return map[string]any{"bytes_written": len(decoded)}, ""
+}
+
+func doFetchURL(ctx context.Context, params map[string]any) (map[string]any, string) {
+	rawURL, _ := params["url"].(string)
+	client := &http.Client{}
+	if *insecure {
+		client.Transport = &http.Transport{
+			TLSClientConfig: &tls.Config{InsecureSkipVerify: true}, //nolint:gosec
+		}
+	}
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, rawURL, nil)
+	if err != nil {
+		return nil, err.Error()
+	}
+	resp, err := client.Do(req)
+	if err != nil {
+		return nil, err.Error()
+	}
+	defer func() { _ = resp.Body.Close() }()
+	body, _ := io.ReadAll(resp.Body)
+	return map[string]any{
+		"status": resp.StatusCode,
+		"body":   base64.StdEncoding.EncodeToString(body),
+	}, ""
 }
 
 func currentUser() string {

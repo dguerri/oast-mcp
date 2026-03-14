@@ -397,39 +397,15 @@ func (s *Server) handleAgentTaskCancel(ctx context.Context, req mcpgo.CallToolRe
 
 // handleAgentTaskInteract handles the agent_task_interact tool call.
 func (s *Server) handleAgentTaskInteract(ctx context.Context, req mcpgo.CallToolRequest) (*mcpgo.CallToolResult, error) {
-	claims, ok := claimsFromCtx(ctx)
-	if !ok {
-		return toolError("unauthorized")
-	}
-	if err := auth.RequireScope(claims, "agent:admin"); err != nil {
-		s.audit.Log(s.newAuditEvent(ctx, "agent.task.interact", "denied"))
-		return toolError("insufficient scope: agent:admin required")
-	}
-	if !s.rl.Allow(claims.TenantID) {
-		return toolError("rate limit exceeded")
-	}
-
-	taskID := req.GetString("task_id", "")
-	if taskID == "" {
-		return toolError("task_id is required")
-	}
-
-	task, err := s.store.GetTask(ctx, taskID, claims.TenantID)
+	claims, task, errResult, err := s.validateInteractRequest(ctx, req)
 	if err != nil {
-		if errors.Is(err, store.ErrNotFound) {
-			return toolError("task not found")
-		}
-		s.logger.Error("failed to get task", "error", err)
-		return toolError("failed to get task")
+		return nil, err
+	}
+	if errResult != nil {
+		return errResult, nil
 	}
 
-	if task.Capability != "interactive_exec" {
-		return toolError("task is not interactive — use agent_task_status instead")
-	}
-
-	if s.agentSrv == nil {
-		return toolError("agent server not configured")
-	}
+	taskID := task.TaskID
 
 	// Send stdin if provided.
 	stdinData := req.GetString("stdin", "")
@@ -475,6 +451,55 @@ func (s *Server) handleAgentTaskInteract(ctx context.Context, req mcpgo.CallTool
 		resp["error"] = errMsg
 	}
 	return toolJSON(resp)
+}
+
+// validateInteractRequest performs auth, rate-limit, and task validation for
+// agent_task_interact. Returns (claims, task, nil, nil) on success, or
+// (nil, nil, errorResult, nil) for tool-level errors.
+func (s *Server) validateInteractRequest(ctx context.Context, req mcpgo.CallToolRequest) (*auth.Claims, *store.Task, *mcpgo.CallToolResult, error) {
+	claims, ok := claimsFromCtx(ctx)
+	if !ok {
+		r, _ := toolError("unauthorized")
+		return nil, nil, r, nil
+	}
+	if err := auth.RequireScope(claims, "agent:admin"); err != nil {
+		s.audit.Log(s.newAuditEvent(ctx, "agent.task.interact", "denied"))
+		r, _ := toolError("insufficient scope: agent:admin required")
+		return nil, nil, r, nil
+	}
+	if !s.rl.Allow(claims.TenantID) {
+		r, _ := toolError("rate limit exceeded")
+		return nil, nil, r, nil
+	}
+
+	taskID := req.GetString("task_id", "")
+	if taskID == "" {
+		r, _ := toolError("task_id is required")
+		return nil, nil, r, nil
+	}
+
+	task, err := s.store.GetTask(ctx, taskID, claims.TenantID)
+	if err != nil {
+		if errors.Is(err, store.ErrNotFound) {
+			r, _ := toolError("task not found")
+			return nil, nil, r, nil
+		}
+		s.logger.Error("failed to get task", "error", err)
+		r, _ := toolError("failed to get task")
+		return nil, nil, r, nil
+	}
+
+	if task.Capability != "interactive_exec" {
+		r, _ := toolError("task is not interactive — use agent_task_status instead")
+		return nil, nil, r, nil
+	}
+
+	if s.agentSrv == nil {
+		r, _ := toolError("agent server not configured")
+		return nil, nil, r, nil
+	}
+
+	return claims, task, nil, nil
 }
 
 const (
