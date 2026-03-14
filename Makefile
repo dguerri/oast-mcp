@@ -20,7 +20,7 @@ VM_IMAGE        ?= debian-cloud/debian-12
 .PHONY: smoke
 .PHONY: secrets tf-generate tf-init tf-apply inventory ansible deploy teardown
 
-COVER_THRESHOLD ?= 60
+COVER_THRESHOLD ?= 70
 
 # ── Go ────────────────────────────────────────────────────────────────────────
 
