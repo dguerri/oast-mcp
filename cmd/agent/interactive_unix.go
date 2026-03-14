@@ -21,7 +21,6 @@ import (
 	"encoding/base64"
 	"io"
 	"os/exec"
-	"syscall"
 
 	"github.com/creack/pty"
 )
@@ -31,7 +30,8 @@ import (
 // When the process exits, it sends a final result message with exit_code.
 func runInteractive(ctx context.Context, taskID, command string, binary bool, results chan outMsg) io.WriteCloser {
 	c := exec.CommandContext(ctx, "/bin/sh", "-c", command)
-	c.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
+	// Do not set SysProcAttr here — pty.Start sets Setsid=true internally
+	// and combining it with Setpgid causes EPERM on fork.
 
 	ptmx, err := pty.Start(c)
 	if err != nil {

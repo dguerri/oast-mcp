@@ -21,6 +21,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"time"
 
@@ -109,14 +110,18 @@ func (s *Server) registerAgentTools() {
 				"  2. Read initial output: agent_task_interact(task_id=...) — no stdin, just drain startup output\n"+
 				"  3. Send input + read response: agent_task_interact(task_id=..., stdin=\"yes\\n\")\n"+
 				"  4. Repeat until the process exits (running=false in the response)\n\n"+
-				"stdin is written to the process verbatim (include \\n for newlines).\n"+
+				"C-style escape sequences in stdin are interpreted before sending:\n"+
+				"  \\n = newline, \\r = carriage return, \\t = tab, \\\\ = literal backslash,\n"+
+				"  \\xNN = hex byte (e.g. \\x03 = Ctrl-C, \\x04 = Ctrl-D, \\x1b = Escape).\n"+
 				"By default, stdout/stderr are returned as UTF-8 text. Set binary=true to use "+
 				"base64 encoding for both directions (e.g. when the process emits raw binary).\n\n"+
 				"If wait=true (default) and no output is available yet, the call blocks server-side "+
 				"until output arrives or timeout_secs elapses — no polling loop needed.\n\n"+
 				"Returns {stdout, stderr, running, exit_code}. exit_code is present only when running=false."),
 		mcpgo.WithString("task_id", mcpgo.Required(), mcpgo.Description("The task ID of the interactive_exec task")),
-		mcpgo.WithString("stdin", mcpgo.Description("Data to write to the process stdin (include \\n for newlines)")),
+		mcpgo.WithString("stdin", mcpgo.Description(
+			"Data to write to the process stdin. C-style escapes are interpreted: "+
+				"\\n (newline), \\r (CR), \\t (tab), \\\\ (backslash), \\xNN (hex byte, e.g. \\x03 for Ctrl-C)")),
 		mcpgo.WithBoolean("binary", mcpgo.Description(
 			"When true, stdin is expected as base64 and stdout/stderr are returned as base64 (default: false)")),
 		mcpgo.WithBoolean("wait", mcpgo.Description(
@@ -407,9 +412,10 @@ func (s *Server) handleAgentTaskInteract(ctx context.Context, req mcpgo.CallTool
 
 	taskID := task.TaskID
 
-	// Send stdin if provided.
+	// Send stdin if provided (interpret C-style escapes).
 	stdinData := req.GetString("stdin", "")
 	if stdinData != "" {
+		stdinData = unescapeStdin(stdinData)
 		if err := s.agentSrv.SendStdin(taskID, task.AgentID, claims.TenantID, stdinData); err != nil {
 			return toolError("failed to send stdin: " + err.Error())
 		}
@@ -521,6 +527,54 @@ func parseWaitParams(req mcpgo.CallToolRequest) (bool, int) {
 		timeout = maxWaitTimeoutSecs
 	}
 	return wait, timeout
+}
+
+// unescapeStdin interprets C-style escape sequences in s so that LLMs can
+// write e.g. "id\n" and have it arrive as a real newline.
+// Supported: \n \r \t \a \b \\ \xNN.
+func unescapeStdin(s string) string {
+	var buf strings.Builder
+	buf.Grow(len(s))
+	for i := 0; i < len(s); i++ {
+		if s[i] != '\\' || i+1 >= len(s) {
+			buf.WriteByte(s[i])
+			continue
+		}
+		switch s[i+1] {
+		case 'n':
+			buf.WriteByte('\n')
+			i++
+		case 'r':
+			buf.WriteByte('\r')
+			i++
+		case 't':
+			buf.WriteByte('\t')
+			i++
+		case 'a':
+			buf.WriteByte('\a')
+			i++
+		case 'b':
+			buf.WriteByte('\b')
+			i++
+		case '\\':
+			buf.WriteByte('\\')
+			i++
+		case 'x':
+			if i+3 < len(s) {
+				if val, err := strconv.ParseUint(s[i+2:i+4], 16, 8); err == nil {
+					buf.WriteByte(byte(val))
+					i += 3
+				} else {
+					buf.WriteByte('\\')
+				}
+			} else {
+				buf.WriteByte('\\')
+			}
+		default:
+			buf.WriteByte('\\')
+		}
+	}
+	return buf.String()
 }
 
 // handleAgentTaskStatus handles the agent_task_status tool call.
