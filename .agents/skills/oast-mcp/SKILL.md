@@ -93,6 +93,7 @@ Call `oast_wait_for_event` once — whichever label fires tells you what tool is
 
 ```
 probe OS/arch → agent_dropper_generate → run command on target → agent_list → agent_task_schedule → agent_task_status
+                                                                              ↳ interactive_exec → agent_task_interact (repeat) → agent_task_cancel (if needed)
 ```
 
 1. **Probe** target: `uname -m` (Linux) or `$ENV:PROCESSOR_ARCHITECTURE` (Windows).
@@ -113,6 +114,7 @@ probe OS/arch → agent_dropper_generate → run command on target → agent_lis
    - Response includes `timed_out: true` when the wait timeout fires before the task completes.
    - Set `wait: false` to get the current status instantly without blocking. Use this when checking multiple tasks in parallel, showing intermediate progress, or doing other work between checks.
    - If `timed_out: true`, call `agent_task_status` again (the task is still running on the agent).
+7. **`agent_task_cancel`** — abort a pending or running task. Pass `task_id` and `agent_id`. The agent kills the subprocess immediately.
 
 ## Capability Reference
 
