@@ -6,7 +6,7 @@
 <h1 align="center">OAST-MCP</h1>
 <!-- markdownlint-enable MD033 MD041 -->
 
-[![CI](https://github.com/dguerri/oast-mcp/actions/workflows/ci.yml/badge.svg)](https://github.com/dguerri/oast-mcp/actions/workflows/ci.yml) [![Coverage](https://codecov.io/gh/dguerri/oast-mcp/branch/main/graph/badge.svg)](https://codecov.io/gh/dguerri/oast-mcp) [![Go version](https://img.shields.io/badge/go-1.25-00ADD8?logo=go)](https://go.dev/dl/) [![License](https://img.shields.io/badge/license-Apache%202.0-blue.svg)](LICENSE)
+[![License](https://img.shields.io/badge/license-Apache%202.0-blue.svg)](LICENSE) [![Go Report Card](https://goreportcard.com/badge/github.com/dguerri/oast-mcp)](https://goreportcard.com/report/github.com/dguerri/oast-mcp)  [![CI](https://github.com/dguerri/oast-mcp/actions/workflows/ci.yml/badge.svg)](https://github.com/dguerri/oast-mcp/actions/workflows/ci.yml)  [![Go version](https://img.shields.io/badge/go-1.25-00ADD8?logo=go)](https://go.dev/dl/)  [![Coverage](https://codecov.io/gh/dguerri/oast-mcp/branch/main/graph/badge.svg)](https://codecov.io/gh/dguerri/oast-mcp)  [![Conventional Commits](https://img.shields.io/badge/Conventional%20Commits-1.0.0-yellow.svg)](https://conventionalcommits.org)
 
 **Out-of-Band Application Security Testing via the Model Context Protocol.**
 
@@ -19,7 +19,7 @@ All from a single, audited MCP interface.
 │          AI Assistant (Claude, GPT-4o, …)              │
 │            MCP client → SSE transport                  │
 └───────────────────────┬────────────────────────────────┘
-                     │ HTTPS (Caddy TLS termination)
+                        │ HTTPS (Caddy TLS termination)
 ┌───────────────────────▼────────────────────────────────┐
 │  oast-mcp  (127.0.0.1)                                 │
 │  ┌─────────────────┐   ┌──────────────────────────┐    │
