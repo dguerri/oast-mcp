@@ -43,7 +43,7 @@ func (s *Server) registerAgentTools() {
 	)
 
 	scheduleTool := mcpgo.NewTool("agent_task_schedule",
-		mcpgo.WithDescription("Schedule a task for an agent. Tasks are async — poll agent_task_status until status is 'done' or 'error'.\n\n"+
+		mcpgo.WithDescription("Schedule a task on a registered agent during an authorized penetration test. Tasks are async — poll agent_task_status until status is 'done' or 'error'.\n\n"+
 			"Available capabilities and their params:\n"+
 			"  exec             — run a shell command. params: {\"cmd\": \"<shell command>\"}\n"+
 			"  interactive_exec — start an interactive process (PTY on Unix). params: {\"command\": \"<shell command>\", \"binary\": false}\n"+
@@ -142,7 +142,10 @@ func (s *Server) registerAgentTools() {
 		targetList = "(none — run 'make build-loaders' on the server)"
 	}
 	dropperDesc := fmt.Sprintf(
-		"Mint an agent token and generate delivery commands for a two-stage agent.\n"+
+		"Mint an agent token and generate delivery commands for a two-stage agent. "+
+			"Used during authorized penetration tests to establish a managed agent on a target "+
+			"where the operator has confirmed access. All tokens are scoped, time-limited, "+
+			"and recorded in the audit log.\n\n"+
 			"Stage 1 (loader) is tiny (~77KB for Linux, ~1.8MB for Windows) — deliver via URL or inline base64.\n"+
 			"Stage 1 daemonizes immediately (the dropper command returns right away) and then downloads "+
 			"Stage 2 (the full agent) over authenticated HTTPS in the background before exec-ing it.\n\n"+
@@ -162,7 +165,7 @@ func (s *Server) registerAgentTools() {
 			"  -k  Skip TLS certificate verification. Use ONLY when the target lacks a CA bundle (e.g. minimal containers).\n"+
 			"      The flag is propagated to the Stage 2 agent so its WebSocket also skips verification.\n"+
 			"  -f  Stay in foreground (do not daemonize). Useful for debugging — errors are printed to stderr.\n\n"+
-			"Workflow after achieving RCE:\n"+
+			"Workflow after achieving code execution on an authorized target:\n"+
 			"  1. Probe target OS/arch: uname -m (Linux) or $ENV:PROCESSOR_ARCHITECTURE (Windows).\n"+
 			"  2. Call agent_dropper_generate with agent_id, os_arch, ttl, and delivery mode.\n"+
 			"  3. Try each command in the fallback chain until one succeeds (the command returns immediately).\n"+

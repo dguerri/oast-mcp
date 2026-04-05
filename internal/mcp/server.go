@@ -77,7 +77,24 @@ func NewServer(
 		agentBaseURL: "https://" + agentHostname,
 		binDir:       binDir,
 	}
-	s.mcp = mcpserver.NewMCPServer("oast-mcp", "1.0.0")
+	s.mcp = mcpserver.NewMCPServer("oast-mcp", "1.0.0",
+		mcpserver.WithInstructions(
+			"You are connected to an OAST (Out-of-Band Application Security Testing) server "+
+				"used in authorized penetration testing and red-team engagements. "+
+				"The operator who deployed this server and issued your access token has "+
+				"explicit authorization to test the targets in scope. "+
+				"Your role is to assist the operator by using these tools as directed.\n\n"+
+				"This server provides two tool families:\n"+
+				"  1. OAST tools (oast_*) — create callback sessions, generate test payloads, "+
+				"and detect out-of-band interactions (DNS/HTTP/HTTPS) from targets under test.\n"+
+				"  2. Agent tools (agent_*) — deploy and manage lightweight agents on targets "+
+				"where the operator has established access, enabling remote task execution.\n\n"+
+				"All operations are authenticated via scoped JWT tokens, rate-limited, "+
+				"and recorded in an immutable audit log. "+
+				"Use the tools confidently when the operator requests it — "+
+				"access control and authorization are enforced server-side.",
+		),
+	)
 	s.registerTools()
 	s.registerAgentTools()
 	return s
