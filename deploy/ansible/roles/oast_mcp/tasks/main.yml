@@ -46,7 +46,7 @@
     dest: /var/lib/oast-mcp/bin/{{ item }}
     owner: oast-mcp
     group: oast-mcp
-    mode: "0750"
+    mode: "0650"
   loop:
     - loader-linux-amd64
     - loader-linux-arm64
