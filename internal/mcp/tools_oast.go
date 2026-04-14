@@ -617,98 +617,54 @@ func dispatchResult(r *gomcp.CallToolResult, _ any, err error) (*gomcp.CallToolR
 	return r, nil
 }
 
+// toolHandlerFunc is a generic dispatch function for a single tool.
+type toolHandlerFunc func(ctx context.Context, s *Server, req *gomcp.CallToolRequest, args map[string]any) (*gomcp.CallToolResult, any, error)
+
+// typedDispatcher returns a toolHandlerFunc that unmarshals args into T and
+// calls the provided handler. This avoids repeating the unmarshal boilerplate
+// for every case in CallTool.
+func typedDispatcher[T any](handler func(context.Context, *gomcp.CallToolRequest, T) (*gomcp.CallToolResult, any, error)) toolHandlerFunc {
+	return func(ctx context.Context, s *Server, req *gomcp.CallToolRequest, args map[string]any) (*gomcp.CallToolResult, any, error) {
+		var input T
+		if err := unmarshalArgs(args, &input); err != nil {
+			return toolError("invalid args: " + err.Error())
+		}
+		return handler(ctx, req, input)
+	}
+}
+
+// toolDispatchTable returns a map from tool name to its dispatch function.
+// Methods are bound to s at call time so the map is built once per CallTool
+// invocation (cheap — it is only used in tests).
+func (s *Server) toolDispatchTable() map[string]toolHandlerFunc {
+	return map[string]toolHandlerFunc{
+		// ── OAST tools ────────────────────────────────────────────────────────
+		"oast_create_session":   typedDispatcher(s.handleCreateSession),
+		"oast_list_sessions":    typedDispatcher(s.handleListSessions),
+		"oast_list_events":      typedDispatcher(s.handleListEvents),
+		"oast_close_session":    typedDispatcher(s.handleCloseSession),
+		"oast_wait_for_event":   typedDispatcher(s.handleWaitForEvent),
+		"oast_generate_payload": typedDispatcher(s.handleGeneratePayload),
+		// ── Agent tools ───────────────────────────────────────────────────────
+		"agent_list":             typedDispatcher(s.handleAgentList),
+		"agent_task_schedule":    typedDispatcher(s.handleAgentTaskSchedule),
+		"agent_task_status":      typedDispatcher(s.handleAgentTaskStatus),
+		"agent_task_cancel":      typedDispatcher(s.handleAgentTaskCancel),
+		"agent_task_interact":    typedDispatcher(s.handleAgentTaskInteract),
+		"agent_dropper_generate": typedDispatcher(s.handleAgentDropperGenerate),
+	}
+}
+
 // CallTool calls a tool handler directly with the given context and arguments.
 // This is used for testing to bypass the HTTP layer.
 func (s *Server) CallTool(ctx context.Context, name string, args map[string]any) (*gomcp.CallToolResult, error) {
 	req := &gomcp.CallToolRequest{}
-
-	switch name {
-	// ── OAST tools ──────────────────────────────────────────────────────────
-	case "oast_create_session":
-		var input CreateSessionInput
-		if err := unmarshalArgs(args, &input); err != nil {
-			return dispatchResult(toolError("invalid args: " + err.Error()))
-		}
-		return dispatchResult(s.handleCreateSession(ctx, req, input))
-
-	case "oast_list_sessions":
-		return dispatchResult(s.handleListSessions(ctx, req, ListSessionsInput{}))
-
-	case "oast_list_events":
-		var input ListEventsInput
-		if err := unmarshalArgs(args, &input); err != nil {
-			return dispatchResult(toolError("invalid args: " + err.Error()))
-		}
-		return dispatchResult(s.handleListEvents(ctx, req, input))
-
-	case "oast_close_session":
-		var input CloseSessionInput
-		if err := unmarshalArgs(args, &input); err != nil {
-			return dispatchResult(toolError("invalid args: " + err.Error()))
-		}
-		return dispatchResult(s.handleCloseSession(ctx, req, input))
-
-	case "oast_wait_for_event":
-		var input WaitForEventInput
-		if err := unmarshalArgs(args, &input); err != nil {
-			return dispatchResult(toolError("invalid args: " + err.Error()))
-		}
-		return dispatchResult(s.handleWaitForEvent(ctx, req, input))
-
-	case "oast_generate_payload":
-		var input GeneratePayloadInput
-		if err := unmarshalArgs(args, &input); err != nil {
-			return dispatchResult(toolError("invalid args: " + err.Error()))
-		}
-		return dispatchResult(s.handleGeneratePayload(ctx, req, input))
-
-	// ── Agent tools ─────────────────────────────────────────────────────────
-	case "agent_list":
-		var input AgentListInput
-		if err := unmarshalArgs(args, &input); err != nil {
-			return dispatchResult(toolError("invalid args: " + err.Error()))
-		}
-		return dispatchResult(s.handleAgentList(ctx, req, input))
-
-	case "agent_task_schedule":
-		var input AgentTaskScheduleInput
-		if err := unmarshalArgs(args, &input); err != nil {
-			return dispatchResult(toolError("invalid args: " + err.Error()))
-		}
-		return dispatchResult(s.handleAgentTaskSchedule(ctx, req, input))
-
-	case "agent_task_status":
-		var input AgentTaskStatusInput
-		if err := unmarshalArgs(args, &input); err != nil {
-			return dispatchResult(toolError("invalid args: " + err.Error()))
-		}
-		return dispatchResult(s.handleAgentTaskStatus(ctx, req, input))
-
-	case "agent_task_cancel":
-		var input AgentTaskCancelInput
-		if err := unmarshalArgs(args, &input); err != nil {
-			return dispatchResult(toolError("invalid args: " + err.Error()))
-		}
-		return dispatchResult(s.handleAgentTaskCancel(ctx, req, input))
-
-	case "agent_task_interact":
-		var input AgentTaskInteractInput
-		if err := unmarshalArgs(args, &input); err != nil {
-			return dispatchResult(toolError("invalid args: " + err.Error()))
-		}
-		return dispatchResult(s.handleAgentTaskInteract(ctx, req, input))
-
-	case "agent_dropper_generate":
-		var input AgentDropperGenerateInput
-		if err := unmarshalArgs(args, &input); err != nil {
-			return dispatchResult(toolError("invalid args: " + err.Error()))
-		}
-		return dispatchResult(s.handleAgentDropperGenerate(ctx, req, input))
-
-	default:
+	handler, ok := s.toolDispatchTable()[name]
+	if !ok {
 		return &gomcp.CallToolResult{
 			IsError: true,
 			Content: []gomcp.Content{&gomcp.TextContent{Text: "unknown tool: " + name}},
 		}, nil
 	}
+	return dispatchResult(handler(ctx, s, req, args))
 }
