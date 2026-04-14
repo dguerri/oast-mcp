@@ -12,7 +12,8 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-// Package mcp implements the MCP SSE server and registers all OAST and agent tools.
+// Package mcp implements the MCP server (SSE and Streamable HTTP transports)
+// and registers all OAST and agent tools.
 package mcp
 
 import (
@@ -179,9 +180,14 @@ func (s *Server) newAuditEvent(ctx context.Context, action, outcome string) audi
 	return ev
 }
 
-// Handler returns an http.Handler that validates JWT on every SSE/message request.
+// Handler returns an http.Handler that validates JWT on every request and then
+// dispatches to one of two MCP transports:
+//   - Streamable HTTP (MCP 2025-11-25 spec) at /mcp
+//   - Legacy SSE transport at /sse (event stream) and /message (JSON-RPC uplink)
 func (s *Server) Handler() http.Handler {
 	sseHandler := mcpserver.NewSSEServer(s.mcp, mcpserver.WithBaseURL(s.mcpBaseURL))
+	streamHandler := mcpserver.NewStreamableHTTPServer(s.mcp)
+
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		token := strings.TrimPrefix(r.Header.Get("Authorization"), "Bearer ")
 		if token == "" {
@@ -205,7 +211,12 @@ func (s *Server) Handler() http.Handler {
 			RemoteAddr:    r.RemoteAddr,
 			XForwardedFor: r.Header.Get("X-Forwarded-For"),
 		})
-		sseHandler.ServeHTTP(w, r.WithContext(ctx))
+		r = r.WithContext(ctx)
+		if r.URL.Path == "/mcp" {
+			streamHandler.ServeHTTP(w, r)
+			return
+		}
+		sseHandler.ServeHTTP(w, r)
 	})
 }
 

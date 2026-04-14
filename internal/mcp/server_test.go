@@ -26,6 +26,7 @@ import (
 	"os"
 	"path/filepath"
 	"sort"
+	"strings"
 	"testing"
 	"time"
 
@@ -105,11 +106,11 @@ func TestHandler_RevokedToken(t *testing.T) {
 	assert.Contains(t, w.Body.String(), "invalid token")
 }
 
-// TestHandler_ValidToken verifies that a request with a valid, non-revoked JWT
-// is forwarded to the underlying SSE handler (i.e., does not return 401).
+// TestHandler_ValidToken_SSE verifies that a request with a valid, non-revoked JWT
+// is forwarded to the underlying SSE handler at /sse (i.e., does not return 401).
 // Because the SSE handler keeps the connection open indefinitely, we cancel
 // the request context after a short delay and inspect what was written so far.
-func TestHandler_ValidToken(t *testing.T) {
+func TestHandler_ValidToken_SSE(t *testing.T) {
 	srv, a, _ := newHandlerTestServer(t)
 
 	token, err := a.Issue("alice", []string{"oast:read", "oast:write"}, time.Hour)
@@ -129,6 +130,28 @@ func TestHandler_ValidToken(t *testing.T) {
 	// The auth middleware must NOT have written a 401.
 	assert.NotEqual(t, http.StatusUnauthorized, w.Code,
 		"valid token should not be rejected; got status %d body: %s", w.Code, w.Body.String())
+}
+
+// TestHandler_ValidToken_StreamableHTTP verifies that a valid JWT reaches the
+// Streamable HTTP handler at /mcp without being rejected by the auth middleware.
+func TestHandler_ValidToken_StreamableHTTP(t *testing.T) {
+	srv, a, _ := newHandlerTestServer(t)
+
+	token, err := a.Issue("alice", []string{"oast:read", "oast:write"}, time.Hour)
+	require.NoError(t, err)
+
+	// POST an MCP initialize request to /mcp.
+	body := `{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2024-11-05","capabilities":{},"clientInfo":{"name":"test","version":"0"}}}`
+	req := httptest.NewRequest(http.MethodPost, "/mcp", strings.NewReader(body))
+	req.Header.Set("Authorization", "Bearer "+token)
+	req.Header.Set("Content-Type", "application/json")
+	w := httptest.NewRecorder()
+
+	srv.Handler().ServeHTTP(w, req)
+
+	// The auth middleware must NOT have written a 401.
+	assert.NotEqual(t, http.StatusUnauthorized, w.Code,
+		"valid token should not be rejected at /mcp; got status %d body: %s", w.Code, w.Body.String())
 }
 
 // ── scanLoaderTargets tests ───────────────────────────────────────────────────
