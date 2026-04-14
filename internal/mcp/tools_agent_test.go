@@ -316,6 +316,28 @@ func TestAgentDropperGenerate_URLDelivery(t *testing.T) {
 	assert.Nil(t, resp["b64_cmd"])
 }
 
+// TestAgentDropperGenerate_SlashOsArch verifies that os_arch with a slash
+// separator (e.g. "linux/amd64") works — LLMs naturally send Go-style GOOS/GOARCH.
+func TestAgentDropperGenerate_SlashOsArch(t *testing.T) {
+	srv, a := newDropperServer(t)
+	ctx := makeCtx(t, a, "alice", []string{"agent:admin"})
+
+	result, err := srv.CallTool(ctx, "agent_dropper_generate", map[string]any{
+		"agent_id": "web-01",
+		"os_arch":  "linux/amd64",
+		"ttl":      "1h",
+	})
+	require.NoError(t, err)
+	require.False(t, result.IsError, getResultText(t, result))
+
+	var resp map[string]any
+	require.NoError(t, json.Unmarshal([]byte(getResultText(t, result)), &resp))
+
+	assert.Equal(t, "linux/amd64", resp["os_arch"])
+	assert.Contains(t, resp["download_url"], "loader-linux-amd64")
+	assert.Contains(t, resp["curl_cmd"], "web-01")
+}
+
 // TestAgentDropperGenerate_InlineDelivery verifies that delivery=inline returns
 // b64_cmd with the loader embedded and no URL fields.
 func TestAgentDropperGenerate_InlineDelivery(t *testing.T) {

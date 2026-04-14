@@ -135,25 +135,20 @@ func buildPayload(payloadType, host, httpURL, httpsURL string) string {
 func (s *Server) registerTools() {
 	gomcp.AddTool(s.mcp, &gomcp.Tool{
 		Name: "oast_create_session",
-		Description: "Create a new OAST (Out-of-Band Application Security Testing) session for authorized security testing. " +
-			"Returns a session_id and callback endpoints for DNS, HTTP, and HTTPS interactions. " +
-			"Use these endpoints to detect whether a target application makes out-of-band requests (e.g. SSRF, blind injection). " +
-			"IMPORTANT: save the returned session_id — you must pass it unchanged to oast_generate_payload, " +
-			"oast_wait_for_event, oast_list_events, and oast_close_session. Never mix session IDs across calls.",
+		Description: "Create an OAST callback session. Returns a session_id and DNS/HTTP/HTTPS callback endpoints " +
+			"for detecting out-of-band interactions (SSRF, blind injection, etc.). " +
+			"Save the session_id — pass it to all other oast_* tools.",
 	}, s.handleCreateSession)
 
 	gomcp.AddTool(s.mcp, &gomcp.Tool{
 		Name:        "oast_list_sessions",
-		Description: "List all active OAST sessions for the current tenant.",
+		Description: "List active OAST sessions for the current tenant.",
 	}, s.handleListSessions)
 
 	gomcp.AddTool(s.mcp, &gomcp.Tool{
 		Name: "oast_list_events",
-		Description: "Retrieve recorded OAST interaction events for a session. " +
-			"Returns events that have already arrived — use this to review interactions after waiting, " +
-			"summarize a session, or page through history. " +
-			"To block and wait for the next new callback after injecting a payload, use oast_wait_for_event instead. " +
-			"Paginated via cursor.",
+		Description: "Retrieve recorded callback events for a session. Returns events that have already arrived. " +
+			"Use oast_wait_for_event instead to block for new callbacks in real time. Paginated via cursor.",
 	}, s.handleListEvents)
 
 	gomcp.AddTool(s.mcp, &gomcp.Tool{
@@ -163,35 +158,22 @@ func (s *Server) registerTools() {
 
 	gomcp.AddTool(s.mcp, &gomcp.Tool{
 		Name: "oast_wait_for_event",
-		Description: "Block until at least one new OAST interaction arrives for a session, then return it. " +
-			"Use this immediately after injecting a payload into the TARGET to detect callbacks in real time. " +
-			"Returns timed_out=true if no event arrives within the timeout.\n\n" +
-			"CRITICAL: pass the SAME session_id used in oast_generate_payload. " +
-			"Events are only recorded when the TARGET's server triggers the injected payload — " +
-			"curling the callback URL from the operator machine does NOT produce an event here because it belongs " +
-			"to a different session or tenant context. " +
-			"If timed_out keeps returning true, verify that: " +
-			"(1) the payload was actually injected into the target, not just fetched locally, and " +
-			"(2) the session_id matches the one from oast_create_session.",
+		Description: "Block until a callback arrives for a session. Use after injecting a payload to detect " +
+			"whether the target triggered it. Returns timed_out=true if nothing arrives within the timeout.\n\n" +
+			"IMPORTANT: use the same session_id from oast_create_session. " +
+			"Do NOT fetch the payload URL yourself — only the target's request produces a valid event.",
 	}, s.handleWaitForEvent)
 
 	gomcp.AddTool(s.mcp, &gomcp.Tool{
 		Name: "oast_generate_payload",
-		Description: "Generate a ready-to-use test payload string for a given OAST session. " +
-			"This is a standard technique in authorized penetration testing: the payload embeds a unique callback URL " +
-			"tied to the session so the tester can detect whether a target application processes untrusted input " +
-			"in an unsafe way (e.g. SSRF, XXE, blind SQL injection, Log4Shell). " +
-			"When the TARGET (not you) triggers the payload (DNS lookup or HTTP request), " +
-			"it appears as an event retrievable with oast_wait_for_event.\n\n" +
-			"CRITICAL RULES:\n" +
-			"1. Pass the SAME session_id you got from oast_create_session — using a different or stale session_id " +
-			"means oast_wait_for_event will never see the callback.\n" +
-			"2. NEVER curl or fetch the payload URL yourself to test it. The whole point is to inject the payload " +
-			"into the TARGET and let the target's server call back. Self-testing from the operator machine proves nothing.\n\n" +
-			"An optional label tags the injection point (e.g. 'login-form', 'ua-header'); " +
-			"it appears as a subdomain in the callback URLs so you can immediately tell which injection point fired. " +
-			"The dns_hostname field is always returned regardless of type and can be used directly in any injection context " +
-			"(nslookup, dig, ping, /dev/tcp, wget, python) when the generated payload string doesn't fit.",
+		Description: "Generate a test payload that embeds a unique callback URL for the session. " +
+			"When the TARGET processes the payload (DNS lookup or HTTP request), it appears as an event " +
+			"retrievable with oast_wait_for_event.\n\n" +
+			"IMPORTANT:\n" +
+			"1. Use the same session_id from oast_create_session.\n" +
+			"2. NEVER fetch the payload URL yourself — inject it into the target and let the target call back.\n\n" +
+			"The optional label tags the injection point (appears as a subdomain so you can tell which point fired). " +
+			"The dns_hostname field can be used directly with nslookup, dig, or ping when the full payload doesn't fit.",
 	}, s.handleGeneratePayload)
 }
 

