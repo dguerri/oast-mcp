@@ -28,113 +28,140 @@ import (
 	"github.com/dguerri/oast-mcp/internal/auth"
 	"github.com/dguerri/oast-mcp/internal/store"
 	"github.com/google/uuid"
-	mcpgo "github.com/mark3labs/mcp-go/mcp"
-	mcpserver "github.com/mark3labs/mcp-go/server"
+	gomcp "github.com/modelcontextprotocol/go-sdk/mcp"
 )
+
+// ── Input types ───────────────────────────────────────────────────────────────
+
+// AgentListInput holds parameters for agent_list.
+type AgentListInput struct {
+	ShowExpired bool `json:"show_expired,omitempty" jsonschema:"Include agents whose token has expired (default: false)"`
+}
+
+// AgentTaskScheduleInput holds parameters for agent_task_schedule.
+type AgentTaskScheduleInput struct {
+	AgentID     string         `json:"agent_id" jsonschema:"The agent ID to schedule the task for"`
+	Capability  string         `json:"capability" jsonschema:"One of: exec, interactive_exec, read_file, write_file, fetch_url, system_info"`
+	Params      map[string]any `json:"params,omitempty" jsonschema:"Parameters for the capability (see tool description for schema per capability)"`
+	TimeoutSecs float64        `json:"timeout_secs,omitempty" jsonschema:"Task execution timeout in seconds (default 600, max 86400)"`
+}
+
+// AgentTaskStatusInput holds parameters for agent_task_status.
+type AgentTaskStatusInput struct {
+	TaskID      string   `json:"task_id" jsonschema:"The task ID to check"`
+	Wait        *bool    `json:"wait,omitempty" jsonschema:"Block until the task completes or the wait timeout elapses (default: true). Set to false to return immediately."`
+	TimeoutSecs *float64 `json:"timeout_secs,omitempty" jsonschema:"Wait timeout in seconds (default 30, max 120). Only applies when wait=true."`
+}
+
+// AgentTaskCancelInput holds parameters for agent_task_cancel.
+type AgentTaskCancelInput struct {
+	TaskID  string `json:"task_id" jsonschema:"The task ID to cancel"`
+	AgentID string `json:"agent_id" jsonschema:"The agent ID that owns the task (needed to route the cancel signal)"`
+}
+
+// AgentTaskInteractInput holds parameters for agent_task_interact.
+type AgentTaskInteractInput struct {
+	TaskID      string   `json:"task_id" jsonschema:"The task ID of the interactive_exec task"`
+	Stdin       string   `json:"stdin,omitempty" jsonschema:"Data to write to the process stdin. C-style escapes are interpreted: \\n (newline), \\r (CR), \\t (tab), \\\\ (backslash), \\xNN (hex byte, e.g. \\x03 for Ctrl-C)"`
+	Binary      bool     `json:"binary,omitempty" jsonschema:"When true, stdin is expected as base64 and stdout/stderr are returned as base64 (default: false)"`
+	Wait        *bool    `json:"wait,omitempty" jsonschema:"Block until output is available or timeout elapses (default: true)"`
+	TimeoutSecs *float64 `json:"timeout_secs,omitempty" jsonschema:"Wait timeout in seconds (default 30, max 120). Only applies when wait=true."`
+}
+
+// AgentDropperGenerateInput holds parameters for agent_dropper_generate.
+type AgentDropperGenerateInput struct {
+	AgentID  string `json:"agent_id" jsonschema:"Meaningful name for the agent, e.g. 'web-01'"`
+	OsArch   string `json:"os_arch" jsonschema:"Target OS and architecture"`
+	TTL      string `json:"ttl" jsonschema:"Token lifetime in Go duration format, e.g. '2h', '24h', '168h'"`
+	Delivery string `json:"delivery,omitempty" jsonschema:"Delivery mode: 'url' (default) returns curl/wget commands; 'inline' embeds the loader as base64 for air-gapped targets"`
+	Insecure bool   `json:"insecure,omitempty" jsonschema:"Skip TLS certificate verification (loader -k flag). Use ONLY when the target has no CA bundle (e.g. minimal containers)."`
+}
+
+// ── Constants ─────────────────────────────────────────────────────────────────
+
+const (
+	defaultWaitTimeoutSecs = 30
+	maxWaitTimeoutSecs     = 120
+	waitPollInterval       = 500 * time.Millisecond
+)
+
+// ── Tool registration ─────────────────────────────────────────────────────────
 
 // registerAgentTools registers all agent management tools with the MCP server.
 func (s *Server) registerAgentTools() {
-	listTool := mcpgo.NewTool("agent_list",
-		mcpgo.WithDescription("List agents registered for the current tenant. "+
-			"By default, agents whose token has expired are hidden. "+
-			"Pass show_expired=true to include them. "+
-			"Returns agent_id, status ('online'/'offline'), capabilities, expires_at, and last_seen_at."),
-		mcpgo.WithBoolean("show_expired", mcpgo.Description("Include agents whose token has expired (default: false)")),
-	)
+	gomcp.AddTool(s.mcp, &gomcp.Tool{
+		Name: "agent_list",
+		Description: "List agents registered for the current tenant. " +
+			"By default, agents whose token has expired are hidden. " +
+			"Pass show_expired=true to include them. " +
+			"Returns agent_id, status ('online'/'offline'), capabilities, expires_at, and last_seen_at.",
+	}, s.handleAgentList)
 
-	scheduleTool := mcpgo.NewTool("agent_task_schedule",
-		mcpgo.WithDescription("Schedule a task on a registered agent during an authorized penetration test. Tasks are async — poll agent_task_status until status is 'done' or 'error'.\n\n"+
-			"Available capabilities and their params:\n"+
-			"  exec             — run a shell command. params: {\"cmd\": \"<shell command>\"}\n"+
-			"  interactive_exec — start an interactive process (PTY on Unix). params: {\"command\": \"<shell command>\", \"binary\": false}\n"+
-			"                     Use agent_task_interact to send stdin and read stdout/stderr.\n"+
-			"  read_file        — read a file and return base64-encoded content. params: {\"path\": \"<absolute path>\"}\n"+
-			"  write_file       — write a file from base64-encoded content. params: {\"path\": \"<absolute path>\", \"content_b64\": \"<base64 data>\", \"mode\": \"0644\"}\n"+
-			"  fetch_url        — make an HTTP GET request. params: {\"url\": \"<url>\"}\n"+
-			"  system_info      — return hostname, OS, arch, current user. params: {} (none required)\n\n"+
-			"The timeout_secs parameter controls the overall task deadline (default 600 s = 10 min). "+
-			"The agent enforces this deadline locally, killing any subprocess when it fires. "+
-			"Use agent_task_cancel to abort a pending or running task early.\n\n"+
-			"The returned task_id is used to poll agent_task_status for the result."),
-		mcpgo.WithString("agent_id", mcpgo.Required(), mcpgo.Description("The agent ID to schedule the task for")),
-		mcpgo.WithString("capability", mcpgo.Required(), mcpgo.Description("One of: exec, interactive_exec, read_file, write_file, fetch_url, system_info")),
-		mcpgo.WithObject("params", mcpgo.Description("Parameters for the capability (see tool description for schema per capability)")),
-		mcpgo.WithNumber("timeout_secs", mcpgo.Description(fmt.Sprintf(
-			"Task execution timeout in seconds (default %d, max 86400). "+
-				"This is the deadline for the agent to finish the task — not the wait timeout in agent_task_status.",
-			store.DefaultTaskTimeoutSecs))),
-	)
+	gomcp.AddTool(s.mcp, &gomcp.Tool{
+		Name: "agent_task_schedule",
+		Description: "Schedule a task on a registered agent during an authorized penetration test. " +
+			"Tasks are async — poll agent_task_status until status is 'done' or 'error'.\n\n" +
+			"Available capabilities and their params:\n" +
+			"  exec             — run a shell command. params: {\"cmd\": \"<shell command>\"}\n" +
+			"  interactive_exec — start an interactive process (PTY on Unix). params: {\"command\": \"<shell command>\", \"binary\": false}\n" +
+			"                     Use agent_task_interact to send stdin and read stdout/stderr.\n" +
+			"  read_file        — read a file and return base64-encoded content. params: {\"path\": \"<absolute path>\"}\n" +
+			"  write_file       — write a file from base64-encoded content. params: {\"path\": \"<absolute path>\", \"content_b64\": \"<base64 data>\", \"mode\": \"0644\"}\n" +
+			"  fetch_url        — make an HTTP GET request. params: {\"url\": \"<url>\"}\n" +
+			"  system_info      — return hostname, OS, arch, current user. params: {} (none required)\n\n" +
+			"The timeout_secs parameter controls the overall task deadline (default 600 s = 10 min). " +
+			"The agent enforces this deadline locally, killing any subprocess when it fires. " +
+			"Use agent_task_cancel to abort a pending or running task early.\n\n" +
+			"The returned task_id is used to poll agent_task_status for the result.",
+	}, s.handleAgentTaskSchedule)
 
-	statusTool := mcpgo.NewTool("agent_task_status",
-		mcpgo.WithDescription("Get the status and result of a scheduled agent task. "+
-			"Status progresses: pending → running → done | error.\n\n"+
-			"By default (wait=true), this tool blocks server-side until the task reaches a terminal state "+
-			"('done' or 'error') or the wait timeout elapses — no polling needed. "+
-			"The response includes timed_out=true if the wait timeout fired before the task completed. "+
-			"If the task is already in a terminal state, the tool returns immediately regardless of wait.\n\n"+
-			"Set wait=false to get the current status instantly without blocking. "+
-			"Use wait=false when you need to check multiple tasks in parallel, when you want to show "+
-			"intermediate progress to the user, or when you have other work to do between checks.\n\n"+
-			"timeout_secs controls how long this tool call blocks (default 30, max 120). "+
-			"This is the *wait timeout* — it only affects how long this status query blocks. "+
-			"It is independent of the *task timeout* set in agent_task_schedule, which controls "+
-			"how long the agent has to finish the task overall.\n\n"+
-			"On success, 'result' contains the capability output (e.g. exec: {output, exit_code}; "+
-			"read_file: {content, path} base64-encoded; fetch_url: {status, body} base64-encoded). "+
-			"On error, 'error' contains the error message."),
-		mcpgo.WithString("task_id", mcpgo.Required(), mcpgo.Description("The task ID to check")),
-		mcpgo.WithBoolean("wait", mcpgo.Description(
-			"Block until the task completes or the wait timeout elapses (default: true). "+
-				"Set to false to return the current status immediately without blocking.")),
-		mcpgo.WithNumber("timeout_secs", mcpgo.Description(
-			"Wait timeout in seconds (default 30, max 120). Only applies when wait=true. "+
-				"This controls how long this status call blocks — not the task's execution deadline.")),
-	)
+	gomcp.AddTool(s.mcp, &gomcp.Tool{
+		Name: "agent_task_status",
+		Description: "Get the status and result of a scheduled agent task. " +
+			"Status progresses: pending → running → done | error.\n\n" +
+			"By default (wait=true), this tool blocks server-side until the task reaches a terminal state " +
+			"('done' or 'error') or the wait timeout elapses — no polling needed. " +
+			"The response includes timed_out=true if the wait timeout fired before the task completed. " +
+			"If the task is already in a terminal state, the tool returns immediately regardless of wait.\n\n" +
+			"Set wait=false to get the current status instantly without blocking. " +
+			"Use wait=false when you need to check multiple tasks in parallel, when you want to show " +
+			"intermediate progress to the user, or when you have other work to do between checks.\n\n" +
+			"timeout_secs controls how long this tool call blocks (default 30, max 120). " +
+			"This is the *wait timeout* — it only affects how long this status query blocks. " +
+			"It is independent of the *task timeout* set in agent_task_schedule, which controls " +
+			"how long the agent has to finish the task overall.\n\n" +
+			"On success, 'result' contains the capability output (e.g. exec: {output, exit_code}; " +
+			"read_file: {content, path} base64-encoded; fetch_url: {status, body} base64-encoded). " +
+			"On error, 'error' contains the error message.",
+	}, s.handleAgentTaskStatus)
 
-	cancelTool := mcpgo.NewTool("agent_task_cancel",
-		mcpgo.WithDescription("Cancel a pending or running agent task. "+
-			"Transitions the task to status 'error' with error 'cancelled'. "+
-			"If the agent is currently connected, a cancel signal is forwarded immediately so the agent can kill the running subprocess. "+
-			"Returns an error if the task does not exist or is already in a terminal state (done/error)."),
-		mcpgo.WithString("task_id", mcpgo.Required(), mcpgo.Description("The task ID to cancel")),
-		mcpgo.WithString("agent_id", mcpgo.Required(), mcpgo.Description("The agent ID that owns the task (needed to route the cancel signal)")),
-	)
+	gomcp.AddTool(s.mcp, &gomcp.Tool{
+		Name: "agent_task_cancel",
+		Description: "Cancel a pending or running agent task. " +
+			"Transitions the task to status 'error' with error 'cancelled'. " +
+			"If the agent is currently connected, a cancel signal is forwarded immediately so the agent can kill the running subprocess. " +
+			"Returns an error if the task does not exist or is already in a terminal state (done/error).",
+	}, s.handleAgentTaskCancel)
 
-	interactTool := mcpgo.NewTool("agent_task_interact",
-		mcpgo.WithDescription(
-			"Send input to and read output from a running interactive_exec task.\n\n"+
-				"When an interactive_exec task is scheduled, the agent starts the process under a PTY "+
-				"(Unix) or pipes (Windows). Use this tool to exchange data with the running process.\n\n"+
-				"Workflow:\n"+
-				"  1. Schedule: agent_task_schedule(capability=\"interactive_exec\", params={\"command\": \"...\"})\n"+
-				"  2. Read initial output: agent_task_interact(task_id=...) — no stdin, just drain startup output\n"+
-				"  3. Send input + read response: agent_task_interact(task_id=..., stdin=\"yes\\n\")\n"+
-				"  4. Repeat until the process exits (running=false in the response)\n\n"+
-				"C-style escape sequences in stdin are interpreted before sending:\n"+
-				"  \\n = newline, \\r = carriage return, \\t = tab, \\\\ = literal backslash,\n"+
-				"  \\xNN = hex byte (e.g. \\x03 = Ctrl-C, \\x04 = Ctrl-D, \\x1b = Escape).\n"+
-				"By default, stdout/stderr are returned as UTF-8 text. Set binary=true to use "+
-				"base64 encoding for both directions (e.g. when the process emits raw binary).\n\n"+
-				"If wait=true (default) and no output is available yet, the call blocks server-side "+
-				"until output arrives or timeout_secs elapses — no polling loop needed.\n\n"+
-				"Returns {stdout, stderr, running, exit_code}. exit_code is present only when running=false."),
-		mcpgo.WithString("task_id", mcpgo.Required(), mcpgo.Description("The task ID of the interactive_exec task")),
-		mcpgo.WithString("stdin", mcpgo.Description(
-			"Data to write to the process stdin. C-style escapes are interpreted: "+
-				"\\n (newline), \\r (CR), \\t (tab), \\\\ (backslash), \\xNN (hex byte, e.g. \\x03 for Ctrl-C)")),
-		mcpgo.WithBoolean("binary", mcpgo.Description(
-			"When true, stdin is expected as base64 and stdout/stderr are returned as base64 (default: false)")),
-		mcpgo.WithBoolean("wait", mcpgo.Description(
-			"Block until output is available or timeout elapses (default: true)")),
-		mcpgo.WithNumber("timeout_secs", mcpgo.Description(
-			"Wait timeout in seconds (default 30, max 120). Only applies when wait=true.")),
-	)
-
-	s.mcp.AddTool(listTool, s.handleAgentList)
-	s.mcp.AddTool(scheduleTool, s.handleAgentTaskSchedule)
-	s.mcp.AddTool(statusTool, s.handleAgentTaskStatus)
-	s.mcp.AddTool(cancelTool, s.handleAgentTaskCancel)
-	s.mcp.AddTool(interactTool, s.handleAgentTaskInteract)
+	gomcp.AddTool(s.mcp, &gomcp.Tool{
+		Name: "agent_task_interact",
+		Description: "Send input to and read output from a running interactive_exec task.\n\n" +
+			"When an interactive_exec task is scheduled, the agent starts the process under a PTY " +
+			"(Unix) or pipes (Windows). Use this tool to exchange data with the running process.\n\n" +
+			"Workflow:\n" +
+			"  1. Schedule: agent_task_schedule(capability=\"interactive_exec\", params={\"command\": \"...\"})\n" +
+			"  2. Read initial output: agent_task_interact(task_id=...) — no stdin, just drain startup output\n" +
+			"  3. Send input + read response: agent_task_interact(task_id=..., stdin=\"yes\\n\")\n" +
+			"  4. Repeat until the process exits (running=false in the response)\n\n" +
+			"C-style escape sequences in stdin are interpreted before sending:\n" +
+			"  \\n = newline, \\r = carriage return, \\t = tab, \\\\ = literal backslash,\n" +
+			"  \\xNN = hex byte (e.g. \\x03 = Ctrl-C, \\x04 = Ctrl-D, \\x1b = Escape).\n" +
+			"By default, stdout/stderr are returned as UTF-8 text. Set binary=true to use " +
+			"base64 encoding for both directions (e.g. when the process emits raw binary).\n\n" +
+			"If wait=true (default) and no output is available yet, the call blocks server-side " +
+			"until output arrives or timeout_secs elapses — no polling loop needed.\n\n" +
+			"Returns {stdout, stderr, running, exit_code}. exit_code is present only when running=false.",
+	}, s.handleAgentTaskInteract)
 
 	targets := scanLoaderTargets(s.binDir)
 	targetList := strings.Join(targets, ", ")
@@ -174,38 +201,16 @@ func (s *Server) registerAgentTools() {
 			"  5. Use agent_task_schedule to run capabilities (exec, read_file, fetch_url, system_info).\n\n"+
 			"Available targets: %s", targetList)
 
-	dropperTool := mcpgo.NewTool("agent_dropper_generate",
-		mcpgo.WithDescription(dropperDesc),
-		mcpgo.WithString("agent_id", mcpgo.Required(),
-			mcpgo.Description("Meaningful name for the agent, e.g. 'web-01'")),
-		mcpgo.WithString("os_arch", mcpgo.Required(),
-			mcpgo.Description("Target OS and architecture. One of: "+targetList)),
-		mcpgo.WithString("ttl", mcpgo.Required(),
-			mcpgo.Description("Token lifetime in Go duration format, e.g. '2h', '24h', '168h'")),
-		mcpgo.WithString("delivery",
-			mcpgo.Description("Delivery mode: 'url' (default) returns curl/wget commands; 'inline' embeds the loader as base64 for air-gapped targets")),
-		mcpgo.WithBoolean("insecure",
-			mcpgo.Description("Skip TLS certificate verification (loader -k flag). "+
-				"Use ONLY when the target has no CA bundle (e.g. minimal containers). "+
-				"The flag is propagated to the agent so its WebSocket connection also skips verification.")),
-	)
-	s.mcp.AddTool(dropperTool, s.handleAgentDropperGenerate)
+	gomcp.AddTool(s.mcp, &gomcp.Tool{
+		Name:        "agent_dropper_generate",
+		Description: dropperDesc,
+	}, s.handleAgentDropperGenerate)
 }
 
-// agentHandlers returns the handler map for agent tools, used by CallTool.
-func (s *Server) agentHandlers() map[string]mcpserver.ToolHandlerFunc {
-	return map[string]mcpserver.ToolHandlerFunc{
-		"agent_list":             s.handleAgentList,
-		"agent_task_schedule":    s.handleAgentTaskSchedule,
-		"agent_task_status":      s.handleAgentTaskStatus,
-		"agent_task_cancel":      s.handleAgentTaskCancel,
-		"agent_task_interact":    s.handleAgentTaskInteract,
-		"agent_dropper_generate": s.handleAgentDropperGenerate,
-	}
-}
+// ── Handlers ──────────────────────────────────────────────────────────────────
 
 // handleAgentList handles the agent_list tool call.
-func (s *Server) handleAgentList(ctx context.Context, req mcpgo.CallToolRequest) (*mcpgo.CallToolResult, error) {
+func (s *Server) handleAgentList(ctx context.Context, _ *gomcp.CallToolRequest, input AgentListInput) (*gomcp.CallToolResult, any, error) {
 	claims, ok := claimsFromCtx(ctx)
 	if !ok {
 		return toolError("unauthorized")
@@ -218,9 +223,7 @@ func (s *Server) handleAgentList(ctx context.Context, req mcpgo.CallToolRequest)
 		return toolError("rate limit exceeded")
 	}
 
-	showExpired := req.GetBool("show_expired", false)
-
-	agents, err := s.store.ListAgents(ctx, claims.TenantID, showExpired)
+	agents, err := s.store.ListAgents(ctx, claims.TenantID, input.ShowExpired)
 	if err != nil {
 		s.logger.Error("failed to list agents", "error", err)
 		return toolError("failed to list agents: " + err.Error())
@@ -265,7 +268,7 @@ func (s *Server) handleAgentList(ctx context.Context, req mcpgo.CallToolRequest)
 }
 
 // handleAgentTaskSchedule handles the agent_task_schedule tool call.
-func (s *Server) handleAgentTaskSchedule(ctx context.Context, req mcpgo.CallToolRequest) (*mcpgo.CallToolResult, error) {
+func (s *Server) handleAgentTaskSchedule(ctx context.Context, _ *gomcp.CallToolRequest, input AgentTaskScheduleInput) (*gomcp.CallToolResult, any, error) {
 	claims, ok := claimsFromCtx(ctx)
 	if !ok {
 		return toolError("unauthorized")
@@ -278,20 +281,13 @@ func (s *Server) handleAgentTaskSchedule(ctx context.Context, req mcpgo.CallTool
 		return toolError("rate limit exceeded")
 	}
 
-	agentID := req.GetString("agent_id", "")
+	agentID := input.AgentID
 	if agentID == "" {
 		return toolError("agent_id is required")
 	}
-	capability := req.GetString("capability", "")
+	capability := input.Capability
 	if capability == "" {
 		return toolError("capability is required")
-	}
-
-	var params map[string]any
-	if args := req.GetArguments(); args != nil {
-		if p, ok := args["params"]; ok {
-			params, _ = p.(map[string]any)
-		}
 	}
 
 	if _, err := s.store.GetAgent(ctx, agentID, claims.TenantID); err != nil {
@@ -302,9 +298,12 @@ func (s *Server) handleAgentTaskSchedule(ctx context.Context, req mcpgo.CallTool
 		return toolError("failed to get agent")
 	}
 
-	timeoutSecs, errMsg := parseTimeoutSecs(req.GetArguments())
-	if errMsg != "" {
-		return toolError(errMsg)
+	timeoutSecs := store.DefaultTaskTimeoutSecs
+	if input.TimeoutSecs > 0 {
+		timeoutSecs = int(input.TimeoutSecs)
+		if timeoutSecs > 86400 {
+			return toolError("timeout_secs must not exceed 86400 (24 hours)")
+		}
 	}
 
 	taskID := uuid.New().String()
@@ -316,7 +315,7 @@ func (s *Server) handleAgentTaskSchedule(ctx context.Context, req mcpgo.CallTool
 		TenantID:    claims.TenantID,
 		ScheduledBy: claims.Subject,
 		Capability:  capability,
-		Params:      params,
+		Params:      input.Params,
 		Status:      "pending",
 		CreatedAt:   now,
 		TimeoutSecs: timeoutSecs,
@@ -343,7 +342,7 @@ func (s *Server) handleAgentTaskSchedule(ctx context.Context, req mcpgo.CallTool
 }
 
 // handleAgentTaskCancel handles the agent_task_cancel tool call.
-func (s *Server) handleAgentTaskCancel(ctx context.Context, req mcpgo.CallToolRequest) (*mcpgo.CallToolResult, error) {
+func (s *Server) handleAgentTaskCancel(ctx context.Context, _ *gomcp.CallToolRequest, input AgentTaskCancelInput) (*gomcp.CallToolResult, any, error) {
 	claims, ok := claimsFromCtx(ctx)
 	if !ok {
 		return toolError("unauthorized")
@@ -356,11 +355,11 @@ func (s *Server) handleAgentTaskCancel(ctx context.Context, req mcpgo.CallToolRe
 		return toolError("rate limit exceeded")
 	}
 
-	taskID := req.GetString("task_id", "")
+	taskID := input.TaskID
 	if taskID == "" {
 		return toolError("task_id is required")
 	}
-	agentID := req.GetString("agent_id", "")
+	agentID := input.AgentID
 	if agentID == "" {
 		return toolError("agent_id is required")
 	}
@@ -404,21 +403,23 @@ func (s *Server) handleAgentTaskCancel(ctx context.Context, req mcpgo.CallToolRe
 }
 
 // handleAgentTaskInteract handles the agent_task_interact tool call.
-func (s *Server) handleAgentTaskInteract(ctx context.Context, req mcpgo.CallToolRequest) (*mcpgo.CallToolResult, error) {
-	claims, task, errResult, err := s.validateInteractRequest(ctx, req)
+func (s *Server) handleAgentTaskInteract(ctx context.Context, _ *gomcp.CallToolRequest, input AgentTaskInteractInput) (*gomcp.CallToolResult, any, error) {
+	claims, task, errResult, err := s.validateInteractRequest(ctx, input.TaskID)
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 	if errResult != nil {
-		return errResult, nil
+		return errResult, nil, nil
 	}
 
 	taskID := task.TaskID
 
-	// Send stdin if provided (interpret C-style escapes).
-	stdinData := req.GetString("stdin", "")
+	// Send stdin if provided (interpret C-style escapes, unless binary mode).
+	stdinData := input.Stdin
 	if stdinData != "" {
-		stdinData = unescapeStdin(stdinData)
+		if !input.Binary {
+			stdinData = unescapeStdin(stdinData)
+		}
 		if err := s.agentSrv.SendStdin(taskID, task.AgentID, claims.TenantID, stdinData); err != nil {
 			return toolError("failed to send stdin: " + err.Error())
 		}
@@ -439,7 +440,7 @@ func (s *Server) handleAgentTaskInteract(ctx context.Context, req mcpgo.CallTool
 		return toolError("interactive buffer not found — agent may have disconnected")
 	}
 
-	wait, waitTimeout := parseWaitParams(req)
+	wait, waitTimeout := parseWaitParams(input.Wait, input.TimeoutSecs)
 	deadline := time.Now().Add(time.Duration(waitTimeout) * time.Second)
 
 	stdout, stderr, done, exitCode, errMsg := buf.Drain(wait, deadline)
@@ -465,71 +466,71 @@ func (s *Server) handleAgentTaskInteract(ctx context.Context, req mcpgo.CallTool
 // validateInteractRequest performs auth, rate-limit, and task validation for
 // agent_task_interact. Returns (claims, task, nil, nil) on success, or
 // (nil, nil, errorResult, nil) for tool-level errors.
-func (s *Server) validateInteractRequest(ctx context.Context, req mcpgo.CallToolRequest) (*auth.Claims, *store.Task, *mcpgo.CallToolResult, error) {
+func (s *Server) validateInteractRequest(ctx context.Context, taskID string) (*auth.Claims, *store.Task, *gomcp.CallToolResult, error) {
 	claims, ok := claimsFromCtx(ctx)
 	if !ok {
-		r, _ := toolError("unauthorized")
+		r, _, _ := toolError("unauthorized")
 		return nil, nil, r, nil
 	}
 	if err := auth.RequireScope(claims, "agent:admin"); err != nil {
 		s.audit.Log(s.newAuditEvent(ctx, "agent.task.interact", "denied"))
-		r, _ := toolError("insufficient scope: agent:admin required")
+		r, _, _ := toolError("insufficient scope: agent:admin required")
 		return nil, nil, r, nil
 	}
 	if !s.rl.Allow(claims.TenantID) {
-		r, _ := toolError("rate limit exceeded")
+		r, _, _ := toolError("rate limit exceeded")
 		return nil, nil, r, nil
 	}
 
-	taskID := req.GetString("task_id", "")
 	if taskID == "" {
-		r, _ := toolError("task_id is required")
+		r, _, _ := toolError("task_id is required")
 		return nil, nil, r, nil
 	}
 
 	task, err := s.store.GetTask(ctx, taskID, claims.TenantID)
 	if err != nil {
 		if errors.Is(err, store.ErrNotFound) {
-			r, _ := toolError("task not found")
+			r, _, _ := toolError("task not found")
 			return nil, nil, r, nil
 		}
 		s.logger.Error("failed to get task", "error", err)
-		r, _ := toolError("failed to get task")
+		r, _, _ := toolError("failed to get task")
 		return nil, nil, r, nil
 	}
 
 	if task.Capability != "interactive_exec" {
-		r, _ := toolError("task is not interactive — use agent_task_status instead")
+		r, _, _ := toolError("task is not interactive — use agent_task_status instead")
 		return nil, nil, r, nil
 	}
 
 	if s.agentSrv == nil {
-		r, _ := toolError("agent server not configured")
+		r, _, _ := toolError("agent server not configured")
 		return nil, nil, r, nil
 	}
 
 	return claims, task, nil, nil
 }
 
-const (
-	defaultWaitTimeoutSecs = 30
-	maxWaitTimeoutSecs     = 120
-	waitPollInterval       = 500 * time.Millisecond
-)
+// parseWaitParams extracts the wait (bool) and timeout_secs (int) parameters.
+// wait defaults to true when nil. timeout defaults to defaultWaitTimeoutSecs when nil;
+// an explicit 0 is clamped to the minimum of 1.
+func parseWaitParams(wait *bool, timeoutSecs *float64) (bool, int) {
+	doWait := true
+	if wait != nil {
+		doWait = *wait
+	}
 
-// parseWaitParams extracts the wait (bool) and timeout_secs (int) parameters
-// from the tool request. Returns (wait, timeoutSecs).
-func parseWaitParams(req mcpgo.CallToolRequest) (bool, int) {
-	wait := req.GetBool("wait", true)
-
-	timeout := req.GetInt("timeout_secs", defaultWaitTimeoutSecs)
+	timeout := defaultWaitTimeoutSecs
+	if timeoutSecs != nil {
+		timeout = int(*timeoutSecs)
+	}
 	if timeout < 1 {
 		timeout = 1
 	}
 	if timeout > maxWaitTimeoutSecs {
 		timeout = maxWaitTimeoutSecs
 	}
-	return wait, timeout
+	return doWait, timeout
 }
 
 // unescapeStdin interprets C-style escape sequences in s so that LLMs can
@@ -581,7 +582,7 @@ func unescapeStdin(s string) string {
 }
 
 // handleAgentTaskStatus handles the agent_task_status tool call.
-func (s *Server) handleAgentTaskStatus(ctx context.Context, req mcpgo.CallToolRequest) (*mcpgo.CallToolResult, error) {
+func (s *Server) handleAgentTaskStatus(ctx context.Context, _ *gomcp.CallToolRequest, input AgentTaskStatusInput) (*gomcp.CallToolResult, any, error) {
 	claims, ok := claimsFromCtx(ctx)
 	if !ok {
 		return toolError("unauthorized")
@@ -594,12 +595,12 @@ func (s *Server) handleAgentTaskStatus(ctx context.Context, req mcpgo.CallToolRe
 		return toolError("rate limit exceeded")
 	}
 
-	taskID := req.GetString("task_id", "")
+	taskID := input.TaskID
 	if taskID == "" {
 		return toolError("task_id is required")
 	}
 
-	wait, waitTimeout := parseWaitParams(req)
+	wait, waitTimeout := parseWaitParams(input.Wait, input.TimeoutSecs)
 
 	task, err := s.store.GetTask(ctx, taskID, claims.TenantID)
 	if err != nil {
@@ -694,7 +695,7 @@ func (s *Server) pollUntilTaskDone(ctx context.Context, taskID, tenantID string,
 }
 
 // handleAgentDropperGenerate handles the agent_dropper_generate tool call.
-func (s *Server) handleAgentDropperGenerate(ctx context.Context, req mcpgo.CallToolRequest) (*mcpgo.CallToolResult, error) {
+func (s *Server) handleAgentDropperGenerate(ctx context.Context, _ *gomcp.CallToolRequest, input AgentDropperGenerateInput) (*gomcp.CallToolResult, any, error) {
 	claims, ok := claimsFromCtx(ctx)
 	if !ok {
 		return toolError("unauthorized")
@@ -707,27 +708,26 @@ func (s *Server) handleAgentDropperGenerate(ctx context.Context, req mcpgo.CallT
 		return toolError("rate limit exceeded")
 	}
 
-	agentID := req.GetString("agent_id", "")
-	osArch := req.GetString("os_arch", "")
-	ttlStr := req.GetString("ttl", "")
-	delivery := req.GetString("delivery", "url")
-	insecureTLS := req.GetBool("insecure", false)
+	delivery := input.Delivery
+	if delivery == "" {
+		delivery = "url"
+	}
 
-	ttl, errMsg := parseDropperParams(agentID, osArch, ttlStr, delivery)
+	ttl, errMsg := parseDropperParams(input.AgentID, input.OsArch, input.TTL, delivery)
 	if errMsg != "" {
 		return toolError(errMsg)
 	}
 
-	loaderName := loaderNameForArch(osArch)
+	loaderName := loaderNameForArch(input.OsArch)
 	loaderBytes, err := os.ReadFile(filepath.Join(s.binDir, loaderName))
 	if err != nil {
-		return toolError("no loader available for os_arch: " + osArch +
+		return toolError("no loader available for os_arch: " + input.OsArch +
 			" (run 'make build-loaders' on the server)")
 	}
 
 	// The JWT embeds both tenantID and agentID; the agent server treats
 	// these claims as the sole source of identity.
-	token, err := s.auth.IssueAgent(claims.TenantID, agentID, []string{"agent:connect"}, ttl)
+	token, err := s.auth.IssueAgent(claims.TenantID, input.AgentID, []string{"agent:connect"}, ttl)
 	if err != nil {
 		s.logger.Error("failed to mint agent token", "err", err)
 		return toolError("failed to mint token")
@@ -737,21 +737,21 @@ func (s *Server) handleAgentDropperGenerate(ctx context.Context, req mcpgo.CallT
 	loaderB64 := base64.StdEncoding.EncodeToString(loaderBytes)
 	downloadURL := s.agentBaseURL + "/dl/" + loaderName
 	loaderFlags := ""
-	if insecureTLS {
+	if input.Insecure {
 		loaderFlags = "-k "
 	}
-	launchArgs := fmt.Sprintf("%s%s %s %s", loaderFlags, s.agentBaseURL, token, agentID)
+	launchArgs := fmt.Sprintf("%s%s %s %s", loaderFlags, s.agentBaseURL, token, input.AgentID)
 
-	cmds := buildDropperCmds(osArch, downloadURL, loaderB64, launchArgs, insecureTLS)
+	cmds := buildDropperCmds(input.OsArch, downloadURL, loaderB64, launchArgs, input.Insecure)
 
 	ev := s.newAuditEvent(ctx, "agent.dropper.generate", "ok")
-	ev.Resource = agentID
-	ev.Detail = map[string]any{"os_arch": osArch, "delivery": delivery, "insecure": insecureTLS}
+	ev.Resource = input.AgentID
+	ev.Detail = map[string]any{"os_arch": input.OsArch, "delivery": delivery, "insecure": input.Insecure}
 	s.audit.Log(ev)
 
 	result := map[string]any{
-		"agent_id":   agentID,
-		"os_arch":    osArch,
+		"agent_id":   input.AgentID,
+		"os_arch":    input.OsArch,
 		"token":      token,
 		"expires_at": expiresAt.Format(time.RFC3339),
 		"server_url": s.agentBaseURL,
@@ -775,26 +775,7 @@ func (s *Server) handleAgentDropperGenerate(ctx context.Context, req mcpgo.CallT
 	return toolJSON(result)
 }
 
-// parseTimeoutSecs extracts and validates timeout_secs from tool arguments.
-// Returns DefaultTaskTimeoutSecs when not set, or a non-empty error string on failure.
-func parseTimeoutSecs(args map[string]any) (int, string) {
-	if args == nil {
-		return store.DefaultTaskTimeoutSecs, ""
-	}
-	v, ok := args["timeout_secs"]
-	if !ok {
-		return store.DefaultTaskTimeoutSecs, ""
-	}
-	f, ok := v.(float64)
-	if !ok || f <= 0 {
-		return store.DefaultTaskTimeoutSecs, ""
-	}
-	secs := int(f)
-	if secs > 86400 {
-		return 0, "timeout_secs must not exceed 86400 (24 hours)"
-	}
-	return secs, ""
-}
+// ── Helpers ───────────────────────────────────────────────────────────────────
 
 // parseDropperParams validates agent dropper parameters and returns the parsed TTL.
 // Returns a non-empty error message string on failure.

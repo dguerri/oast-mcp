@@ -16,16 +16,55 @@ package mcp
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"time"
 
-	"github.com/google/uuid"
-	mcpgo "github.com/mark3labs/mcp-go/mcp"
-	mcpserver "github.com/mark3labs/mcp-go/server"
 	"github.com/dguerri/oast-mcp/internal/auth"
 	"github.com/dguerri/oast-mcp/internal/store"
+	"github.com/google/uuid"
+	gomcp "github.com/modelcontextprotocol/go-sdk/mcp"
 )
+
+// ── Input types ───────────────────────────────────────────────────────────────
+
+// CreateSessionInput holds parameters for oast_create_session.
+type CreateSessionInput struct {
+	TTLSeconds float64  `json:"ttl_seconds,omitempty" jsonschema:"Session lifetime in seconds (default: 3600)"`
+	Tags       []string `json:"tags,omitempty" jsonschema:"Optional tags to associate with the session"`
+}
+
+// ListSessionsInput is empty; oast_list_sessions takes no parameters.
+type ListSessionsInput struct{}
+
+// ListEventsInput holds parameters for oast_list_events.
+type ListEventsInput struct {
+	SessionID string  `json:"session_id" jsonschema:"The session ID to poll events for"`
+	Cursor    string  `json:"cursor,omitempty" jsonschema:"Pagination cursor from previous poll (optional)"`
+	Limit     float64 `json:"limit,omitempty" jsonschema:"Maximum number of events to return (default: 50, max: 200)"`
+}
+
+// CloseSessionInput holds parameters for oast_close_session.
+type CloseSessionInput struct {
+	SessionID string `json:"session_id" jsonschema:"The session ID to close"`
+}
+
+// WaitForEventInput holds parameters for oast_wait_for_event.
+type WaitForEventInput struct {
+	SessionID      string  `json:"session_id" jsonschema:"The session ID to wait on"`
+	TimeoutSeconds float64 `json:"timeout_seconds,omitempty" jsonschema:"How long to wait in seconds (1-30, default 10)"`
+	Cursor         string  `json:"cursor,omitempty" jsonschema:"Wait for events after this cursor (optional)"`
+}
+
+// GeneratePayloadInput holds parameters for oast_generate_payload.
+type GeneratePayloadInput struct {
+	SessionID string `json:"session_id" jsonschema:"The session ID"`
+	Type      string `json:"type" jsonschema:"Payload type: url, xxe, ssrf, log4j, img-tag, css-import, sqli-oob. If not otherwise specified, start with url — the returned dns_hostname triggers a DNS callback even when HTTP egress is blocked."`
+	Label     string `json:"label,omitempty" jsonschema:"Injection-point label, e.g. 'login-form' (alphanumeric + hyphens, max 63 chars)"`
+}
+
+// ── View types ────────────────────────────────────────────────────────────────
 
 // eventView is the JSON representation of a store.Event returned by MCP tools.
 type eventView struct {
@@ -90,54 +129,76 @@ func buildPayload(payloadType, host, httpURL, httpsURL string) string {
 	}
 }
 
-// registerTools registers all four OAST tools with the MCP server.
+// ── Tool registration ─────────────────────────────────────────────────────────
+
+// registerTools registers all OAST tools with the MCP server.
 func (s *Server) registerTools() {
-	createTool := mcpgo.NewTool("oast_create_session",
-		mcpgo.WithDescription("Create a new OAST (Out-of-Band Application Security Testing) session for authorized security testing. Returns a session_id and callback endpoints for DNS, HTTP, and HTTPS interactions. Use these endpoints to detect whether a target application makes out-of-band requests (e.g. SSRF, blind injection). IMPORTANT: save the returned session_id — you must pass it unchanged to oast_generate_payload, oast_wait_for_event, oast_list_events, and oast_close_session. Never mix session IDs across calls."),
-		mcpgo.WithNumber("ttl_seconds", mcpgo.Description("Session lifetime in seconds (default: 3600)")),
-		mcpgo.WithArray("tags", mcpgo.WithStringItems(), mcpgo.Description("Optional tags to associate with the session")),
-	)
+	gomcp.AddTool(s.mcp, &gomcp.Tool{
+		Name: "oast_create_session",
+		Description: "Create a new OAST (Out-of-Band Application Security Testing) session for authorized security testing. " +
+			"Returns a session_id and callback endpoints for DNS, HTTP, and HTTPS interactions. " +
+			"Use these endpoints to detect whether a target application makes out-of-band requests (e.g. SSRF, blind injection). " +
+			"IMPORTANT: save the returned session_id — you must pass it unchanged to oast_generate_payload, " +
+			"oast_wait_for_event, oast_list_events, and oast_close_session. Never mix session IDs across calls.",
+	}, s.handleCreateSession)
 
-	listTool := mcpgo.NewTool("oast_list_sessions",
-		mcpgo.WithDescription("List all active OAST sessions for the current tenant."),
-	)
+	gomcp.AddTool(s.mcp, &gomcp.Tool{
+		Name:        "oast_list_sessions",
+		Description: "List all active OAST sessions for the current tenant.",
+	}, s.handleListSessions)
 
-	listEventsTool := mcpgo.NewTool("oast_list_events",
-		mcpgo.WithDescription("Retrieve recorded OAST interaction events for a session. Returns events that have already arrived — use this to review interactions after waiting, summarize a session, or page through history. To block and wait for the next new callback after injecting a payload, use oast_wait_for_event instead. Paginated via cursor."),
-		mcpgo.WithString("session_id", mcpgo.Required(), mcpgo.Description("The session ID to poll events for")),
-		mcpgo.WithString("cursor", mcpgo.Description("Pagination cursor from previous poll (optional)")),
-		mcpgo.WithNumber("limit", mcpgo.Description("Maximum number of events to return (default: 50, max: 200)")),
-	)
+	gomcp.AddTool(s.mcp, &gomcp.Tool{
+		Name: "oast_list_events",
+		Description: "Retrieve recorded OAST interaction events for a session. " +
+			"Returns events that have already arrived — use this to review interactions after waiting, " +
+			"summarize a session, or page through history. " +
+			"To block and wait for the next new callback after injecting a payload, use oast_wait_for_event instead. " +
+			"Paginated via cursor.",
+	}, s.handleListEvents)
 
-	closeTool := mcpgo.NewTool("oast_close_session",
-		mcpgo.WithDescription("Close an OAST session, stopping further event collection."),
-		mcpgo.WithString("session_id", mcpgo.Required(), mcpgo.Description("The session ID to close")),
-	)
+	gomcp.AddTool(s.mcp, &gomcp.Tool{
+		Name:        "oast_close_session",
+		Description: "Close an OAST session, stopping further event collection.",
+	}, s.handleCloseSession)
 
-	waitTool := mcpgo.NewTool("oast_wait_for_event",
-		mcpgo.WithDescription("Block until at least one new OAST interaction arrives for a session, then return it. Use this immediately after injecting a payload into the TARGET to detect callbacks in real time. Returns timed_out=true if no event arrives within the timeout.\n\nCRITICAL: pass the SAME session_id used in oast_generate_payload. Events are only recorded when the TARGET's server triggers the injected payload — curling the callback URL from the operator machine does NOT produce an event here because it belongs to a different session or tenant context. If timed_out keeps returning true, verify that: (1) the payload was actually injected into the target, not just fetched locally, and (2) the session_id matches the one from oast_create_session."),
-		mcpgo.WithString("session_id", mcpgo.Required(), mcpgo.Description("The session ID to wait on")),
-		mcpgo.WithNumber("timeout_seconds", mcpgo.Description("How long to wait in seconds (1–30, default 10)")),
-		mcpgo.WithString("cursor", mcpgo.Description("Wait for events after this cursor (optional)")),
-	)
+	gomcp.AddTool(s.mcp, &gomcp.Tool{
+		Name: "oast_wait_for_event",
+		Description: "Block until at least one new OAST interaction arrives for a session, then return it. " +
+			"Use this immediately after injecting a payload into the TARGET to detect callbacks in real time. " +
+			"Returns timed_out=true if no event arrives within the timeout.\n\n" +
+			"CRITICAL: pass the SAME session_id used in oast_generate_payload. " +
+			"Events are only recorded when the TARGET's server triggers the injected payload — " +
+			"curling the callback URL from the operator machine does NOT produce an event here because it belongs " +
+			"to a different session or tenant context. " +
+			"If timed_out keeps returning true, verify that: " +
+			"(1) the payload was actually injected into the target, not just fetched locally, and " +
+			"(2) the session_id matches the one from oast_create_session.",
+	}, s.handleWaitForEvent)
 
-	generateTool := mcpgo.NewTool("oast_generate_payload",
-		mcpgo.WithDescription("Generate a ready-to-use test payload string for a given OAST session. This is a standard technique in authorized penetration testing: the payload embeds a unique callback URL tied to the session so the tester can detect whether a target application processes untrusted input in an unsafe way (e.g. SSRF, XXE, blind SQL injection, Log4Shell). When the TARGET (not you) triggers the payload (DNS lookup or HTTP request), it appears as an event retrievable with oast_wait_for_event.\n\nCRITICAL RULES:\n1. Pass the SAME session_id you got from oast_create_session — using a different or stale session_id means oast_wait_for_event will never see the callback.\n2. NEVER curl or fetch the payload URL yourself to test it. The whole point is to inject the payload into the TARGET and let the target's server call back. Self-testing from the operator machine proves nothing.\n\nAn optional label tags the injection point (e.g. 'login-form', 'ua-header'); it appears as a subdomain in the callback URLs so you can immediately tell which injection point fired. The dns_hostname field is always returned regardless of type and can be used directly in any injection context (nslookup, dig, ping, /dev/tcp, wget, python) when the generated payload string doesn't fit."),
-		mcpgo.WithString("session_id", mcpgo.Required(), mcpgo.Description("The session ID")),
-		mcpgo.WithString("type", mcpgo.Required(), mcpgo.Description("Payload type: url, xxe, ssrf, log4j, img-tag, css-import, sqli-oob. If not otherwise specified, start with url — the returned dns_hostname triggers a DNS callback even when HTTP egress is blocked.")),
-		mcpgo.WithString("label", mcpgo.Description("Injection-point label, e.g. 'login-form' (alphanumeric + hyphens, max 63 chars)")),
-	)
-
-	s.mcp.AddTool(createTool, s.handleCreateSession)
-	s.mcp.AddTool(listTool, s.handleListSessions)
-	s.mcp.AddTool(listEventsTool, s.handleListEvents)
-	s.mcp.AddTool(closeTool, s.handleCloseSession)
-	s.mcp.AddTool(waitTool, s.handleWaitForEvent)
-	s.mcp.AddTool(generateTool, s.handleGeneratePayload)
+	gomcp.AddTool(s.mcp, &gomcp.Tool{
+		Name: "oast_generate_payload",
+		Description: "Generate a ready-to-use test payload string for a given OAST session. " +
+			"This is a standard technique in authorized penetration testing: the payload embeds a unique callback URL " +
+			"tied to the session so the tester can detect whether a target application processes untrusted input " +
+			"in an unsafe way (e.g. SSRF, XXE, blind SQL injection, Log4Shell). " +
+			"When the TARGET (not you) triggers the payload (DNS lookup or HTTP request), " +
+			"it appears as an event retrievable with oast_wait_for_event.\n\n" +
+			"CRITICAL RULES:\n" +
+			"1. Pass the SAME session_id you got from oast_create_session — using a different or stale session_id " +
+			"means oast_wait_for_event will never see the callback.\n" +
+			"2. NEVER curl or fetch the payload URL yourself to test it. The whole point is to inject the payload " +
+			"into the TARGET and let the target's server call back. Self-testing from the operator machine proves nothing.\n\n" +
+			"An optional label tags the injection point (e.g. 'login-form', 'ua-header'); " +
+			"it appears as a subdomain in the callback URLs so you can immediately tell which injection point fired. " +
+			"The dns_hostname field is always returned regardless of type and can be used directly in any injection context " +
+			"(nslookup, dig, ping, /dev/tcp, wget, python) when the generated payload string doesn't fit.",
+	}, s.handleGeneratePayload)
 }
 
+// ── Handlers ──────────────────────────────────────────────────────────────────
+
 // handleCreateSession handles the oast_create_session tool call.
-func (s *Server) handleCreateSession(ctx context.Context, req mcpgo.CallToolRequest) (*mcpgo.CallToolResult, error) {
+func (s *Server) handleCreateSession(ctx context.Context, _ *gomcp.CallToolRequest, input CreateSessionInput) (*gomcp.CallToolResult, any, error) {
 	claims, ok := claimsFromCtx(ctx)
 	if !ok {
 		return toolError("unauthorized")
@@ -150,8 +211,11 @@ func (s *Server) handleCreateSession(ctx context.Context, req mcpgo.CallToolRequ
 		return toolError("rate limit exceeded")
 	}
 
-	ttlSeconds := req.GetInt("ttl_seconds", 3600)
-	tags := req.GetStringSlice("tags", nil)
+	ttlSeconds := 3600
+	if input.TTLSeconds > 0 {
+		ttlSeconds = int(input.TTLSeconds)
+	}
+	tags := input.Tags
 
 	ttl := time.Duration(ttlSeconds) * time.Second
 	sessionID := uuid.New().String()
@@ -196,7 +260,7 @@ func (s *Server) handleCreateSession(ctx context.Context, req mcpgo.CallToolRequ
 }
 
 // handleListSessions handles the oast_list_sessions tool call.
-func (s *Server) handleListSessions(ctx context.Context, req mcpgo.CallToolRequest) (*mcpgo.CallToolResult, error) {
+func (s *Server) handleListSessions(ctx context.Context, _ *gomcp.CallToolRequest, _ ListSessionsInput) (*gomcp.CallToolResult, any, error) {
 	claims, ok := claimsFromCtx(ctx)
 	if !ok {
 		return toolError("unauthorized")
@@ -264,7 +328,7 @@ func (s *Server) getActiveSession(ctx context.Context, sessionID, tenantID strin
 }
 
 // handleListEvents handles the oast_list_events tool call.
-func (s *Server) handleListEvents(ctx context.Context, req mcpgo.CallToolRequest) (*mcpgo.CallToolResult, error) {
+func (s *Server) handleListEvents(ctx context.Context, _ *gomcp.CallToolRequest, input ListEventsInput) (*gomcp.CallToolResult, any, error) {
 	claims, ok := claimsFromCtx(ctx)
 	if !ok {
 		return toolError("unauthorized")
@@ -277,12 +341,12 @@ func (s *Server) handleListEvents(ctx context.Context, req mcpgo.CallToolRequest
 		return toolError("rate limit exceeded")
 	}
 
-	sessionID := req.GetString("session_id", "")
+	sessionID := input.SessionID
 	if sessionID == "" {
 		return toolError("session_id is required")
 	}
-	cursor := req.GetString("cursor", "")
-	limit := req.GetInt("limit", 50)
+	cursor := input.Cursor
+	limit := int(input.Limit)
 	if limit > 200 {
 		limit = 200
 	}
@@ -329,7 +393,7 @@ func (s *Server) handleListEvents(ctx context.Context, req mcpgo.CallToolRequest
 }
 
 // handleCloseSession handles the oast_close_session tool call.
-func (s *Server) handleCloseSession(ctx context.Context, req mcpgo.CallToolRequest) (*mcpgo.CallToolResult, error) {
+func (s *Server) handleCloseSession(ctx context.Context, _ *gomcp.CallToolRequest, input CloseSessionInput) (*gomcp.CallToolResult, any, error) {
 	claims, ok := claimsFromCtx(ctx)
 	if !ok {
 		return toolError("unauthorized")
@@ -342,7 +406,7 @@ func (s *Server) handleCloseSession(ctx context.Context, req mcpgo.CallToolReque
 		return toolError("rate limit exceeded")
 	}
 
-	sessionID := req.GetString("session_id", "")
+	sessionID := input.SessionID
 	if sessionID == "" {
 		return toolError("session_id is required")
 	}
@@ -368,7 +432,7 @@ func (s *Server) handleCloseSession(ctx context.Context, req mcpgo.CallToolReque
 }
 
 // handleWaitForEvent handles the oast_wait_for_event tool call.
-func (s *Server) handleWaitForEvent(ctx context.Context, req mcpgo.CallToolRequest) (*mcpgo.CallToolResult, error) {
+func (s *Server) handleWaitForEvent(ctx context.Context, _ *gomcp.CallToolRequest, input WaitForEventInput) (*gomcp.CallToolResult, any, error) {
 	claims, ok := claimsFromCtx(ctx)
 	if !ok {
 		return toolError("unauthorized")
@@ -381,12 +445,12 @@ func (s *Server) handleWaitForEvent(ctx context.Context, req mcpgo.CallToolReque
 		return toolError("rate limit exceeded")
 	}
 
-	sessionID := req.GetString("session_id", "")
+	sessionID := input.SessionID
 	if sessionID == "" {
 		return toolError("session_id is required")
 	}
-	cursor := req.GetString("cursor", "")
-	timeoutSecs := req.GetInt("timeout_seconds", 10)
+	cursor := input.Cursor
+	timeoutSecs := int(input.TimeoutSeconds)
 	if timeoutSecs < 1 {
 		timeoutSecs = 1
 	}
@@ -463,7 +527,7 @@ func (s *Server) pollUntilEvent(ctx context.Context, sessionID, tenantID, cursor
 }
 
 // handleGeneratePayload handles the oast_generate_payload tool call.
-func (s *Server) handleGeneratePayload(ctx context.Context, req mcpgo.CallToolRequest) (*mcpgo.CallToolResult, error) {
+func (s *Server) handleGeneratePayload(ctx context.Context, _ *gomcp.CallToolRequest, input GeneratePayloadInput) (*gomcp.CallToolResult, any, error) {
 	claims, ok := claimsFromCtx(ctx)
 	if !ok {
 		return toolError("unauthorized")
@@ -476,15 +540,15 @@ func (s *Server) handleGeneratePayload(ctx context.Context, req mcpgo.CallToolRe
 		return toolError("rate limit exceeded")
 	}
 
-	sessionID := req.GetString("session_id", "")
+	sessionID := input.SessionID
 	if sessionID == "" {
 		return toolError("session_id is required")
 	}
-	payloadType := req.GetString("type", "")
+	payloadType := input.Type
 	if payloadType == "" {
 		return toolError("type is required")
 	}
-	label := req.GetString("label", "")
+	label := input.Label
 	if label != "" && !isValidLabel(label) {
 		return toolError("label must contain only alphanumeric characters and hyphens (max 63 chars)")
 	}
@@ -527,28 +591,124 @@ func (s *Server) handleGeneratePayload(ctx context.Context, req mcpgo.CallToolRe
 	})
 }
 
+// ── Test helper ───────────────────────────────────────────────────────────────
+
+// unmarshalArgs JSON-round-trips args into dst. nil args are a no-op.
+func unmarshalArgs(args map[string]any, dst any) error {
+	if args == nil {
+		return nil
+	}
+	b, err := json.Marshal(args)
+	if err != nil {
+		return fmt.Errorf("marshal: %w", err)
+	}
+	return json.Unmarshal(b, dst)
+}
+
+// dispatchResult converts a 3-value handler return into the 2-value form
+// used by CallTool: any non-nil error is wrapped in an IsError result.
+func dispatchResult(r *gomcp.CallToolResult, _ any, err error) (*gomcp.CallToolResult, error) {
+	if err != nil {
+		return &gomcp.CallToolResult{
+			IsError: true,
+			Content: []gomcp.Content{&gomcp.TextContent{Text: err.Error()}},
+		}, nil
+	}
+	return r, nil
+}
+
 // CallTool calls a tool handler directly with the given context and arguments.
 // This is used for testing to bypass the HTTP layer.
-func (s *Server) CallTool(ctx context.Context, name string, args map[string]any) (*mcpgo.CallToolResult, error) {
-	req := mcpgo.CallToolRequest{}
-	req.Params.Name = name
-	req.Params.Arguments = args
+func (s *Server) CallTool(ctx context.Context, name string, args map[string]any) (*gomcp.CallToolResult, error) {
+	req := &gomcp.CallToolRequest{}
 
-	handlers := map[string]mcpserver.ToolHandlerFunc{
-		"oast_create_session":   s.handleCreateSession,
-		"oast_list_sessions":    s.handleListSessions,
-		"oast_list_events":      s.handleListEvents,
-		"oast_close_session":    s.handleCloseSession,
-		"oast_wait_for_event":   s.handleWaitForEvent,
-		"oast_generate_payload": s.handleGeneratePayload,
-	}
-	for k, v := range s.agentHandlers() {
-		handlers[k] = v
-	}
+	switch name {
+	// ── OAST tools ──────────────────────────────────────────────────────────
+	case "oast_create_session":
+		var input CreateSessionInput
+		if err := unmarshalArgs(args, &input); err != nil {
+			return dispatchResult(toolError("invalid args: " + err.Error()))
+		}
+		return dispatchResult(s.handleCreateSession(ctx, req, input))
 
-	h, ok := handlers[name]
-	if !ok {
-		return toolError("unknown tool: " + name)
+	case "oast_list_sessions":
+		return dispatchResult(s.handleListSessions(ctx, req, ListSessionsInput{}))
+
+	case "oast_list_events":
+		var input ListEventsInput
+		if err := unmarshalArgs(args, &input); err != nil {
+			return dispatchResult(toolError("invalid args: " + err.Error()))
+		}
+		return dispatchResult(s.handleListEvents(ctx, req, input))
+
+	case "oast_close_session":
+		var input CloseSessionInput
+		if err := unmarshalArgs(args, &input); err != nil {
+			return dispatchResult(toolError("invalid args: " + err.Error()))
+		}
+		return dispatchResult(s.handleCloseSession(ctx, req, input))
+
+	case "oast_wait_for_event":
+		var input WaitForEventInput
+		if err := unmarshalArgs(args, &input); err != nil {
+			return dispatchResult(toolError("invalid args: " + err.Error()))
+		}
+		return dispatchResult(s.handleWaitForEvent(ctx, req, input))
+
+	case "oast_generate_payload":
+		var input GeneratePayloadInput
+		if err := unmarshalArgs(args, &input); err != nil {
+			return dispatchResult(toolError("invalid args: " + err.Error()))
+		}
+		return dispatchResult(s.handleGeneratePayload(ctx, req, input))
+
+	// ── Agent tools ─────────────────────────────────────────────────────────
+	case "agent_list":
+		var input AgentListInput
+		if err := unmarshalArgs(args, &input); err != nil {
+			return dispatchResult(toolError("invalid args: " + err.Error()))
+		}
+		return dispatchResult(s.handleAgentList(ctx, req, input))
+
+	case "agent_task_schedule":
+		var input AgentTaskScheduleInput
+		if err := unmarshalArgs(args, &input); err != nil {
+			return dispatchResult(toolError("invalid args: " + err.Error()))
+		}
+		return dispatchResult(s.handleAgentTaskSchedule(ctx, req, input))
+
+	case "agent_task_status":
+		var input AgentTaskStatusInput
+		if err := unmarshalArgs(args, &input); err != nil {
+			return dispatchResult(toolError("invalid args: " + err.Error()))
+		}
+		return dispatchResult(s.handleAgentTaskStatus(ctx, req, input))
+
+	case "agent_task_cancel":
+		var input AgentTaskCancelInput
+		if err := unmarshalArgs(args, &input); err != nil {
+			return dispatchResult(toolError("invalid args: " + err.Error()))
+		}
+		return dispatchResult(s.handleAgentTaskCancel(ctx, req, input))
+
+	case "agent_task_interact":
+		var input AgentTaskInteractInput
+		if err := unmarshalArgs(args, &input); err != nil {
+			return dispatchResult(toolError("invalid args: " + err.Error()))
+		}
+		return dispatchResult(s.handleAgentTaskInteract(ctx, req, input))
+
+	case "agent_dropper_generate":
+		var input AgentDropperGenerateInput
+		if err := unmarshalArgs(args, &input); err != nil {
+			return dispatchResult(toolError("invalid args: " + err.Error()))
+		}
+		return dispatchResult(s.handleAgentDropperGenerate(ctx, req, input))
+
+	default:
+		return &gomcp.CallToolResult{
+			IsError: true,
+			Content: []gomcp.Content{&gomcp.TextContent{Text: "unknown tool: " + name}},
+		}, nil
 	}
-	return h(ctx, req)
 }

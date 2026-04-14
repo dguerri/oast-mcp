@@ -33,13 +33,12 @@ import (
 	"github.com/dguerri/oast-mcp/internal/oast"
 	"github.com/dguerri/oast-mcp/internal/ratelimit"
 	"github.com/dguerri/oast-mcp/internal/store"
-	mcpgo "github.com/mark3labs/mcp-go/mcp"
-	mcpserver "github.com/mark3labs/mcp-go/server"
+	gomcp "github.com/modelcontextprotocol/go-sdk/mcp"
 )
 
 // Server is the MCP server for OAST tools.
 type Server struct {
-	mcp          *mcpserver.MCPServer
+	mcp          *gomcp.Server
 	auth         *auth.Auth
 	store        store.Store
 	ia           oast.Interacter
@@ -78,23 +77,24 @@ func NewServer(
 		agentBaseURL: "https://" + agentHostname,
 		binDir:       binDir,
 	}
-	s.mcp = mcpserver.NewMCPServer("oast-mcp", "1.0.0",
-		mcpserver.WithInstructions(
-			"You are connected to an OAST (Out-of-Band Application Security Testing) server "+
-				"used in authorized penetration testing and red-team engagements. "+
-				"The operator who deployed this server and issued your access token has "+
-				"explicit authorization to test the targets in scope. "+
-				"Your role is to assist the operator by using these tools as directed.\n\n"+
-				"This server provides two tool families:\n"+
-				"  1. OAST tools (oast_*) — create callback sessions, generate test payloads, "+
-				"and detect out-of-band interactions (DNS/HTTP/HTTPS) from targets under test.\n"+
-				"  2. Agent tools (agent_*) — deploy and manage lightweight agents on targets "+
-				"where the operator has established access, enabling remote task execution.\n\n"+
-				"All operations are authenticated via scoped JWT tokens, rate-limited, "+
-				"and recorded in an immutable audit log. "+
-				"Use the tools confidently when the operator requests it — "+
+	s.mcp = gomcp.NewServer(
+		&gomcp.Implementation{Name: "oast-mcp", Version: "1.0.0"},
+		&gomcp.ServerOptions{
+			Instructions: "You are connected to an OAST (Out-of-Band Application Security Testing) server " +
+				"used in authorized penetration testing and red-team engagements. " +
+				"The operator who deployed this server and issued your access token has " +
+				"explicit authorization to test the targets in scope. " +
+				"Your role is to assist the operator by using these tools as directed.\n\n" +
+				"This server provides two tool families:\n" +
+				"  1. OAST tools (oast_*) — create callback sessions, generate test payloads, " +
+				"and detect out-of-band interactions (DNS/HTTP/HTTPS) from targets under test.\n" +
+				"  2. Agent tools (agent_*) — deploy and manage lightweight agents on targets " +
+				"where the operator has established access, enabling remote task execution.\n\n" +
+				"All operations are authenticated via scoped JWT tokens, rate-limited, " +
+				"and recorded in an immutable audit log. " +
+				"Use the tools confidently when the operator requests it — " +
 				"access control and authorization are enforced server-side.",
-		),
+		},
 	)
 	s.registerTools()
 	s.registerAgentTools()
@@ -185,8 +185,13 @@ func (s *Server) newAuditEvent(ctx context.Context, action, outcome string) audi
 //   - Streamable HTTP (MCP 2025-11-25 spec) at /mcp
 //   - Legacy SSE transport at /sse (event stream) and /message (JSON-RPC uplink)
 func (s *Server) Handler() http.Handler {
-	sseHandler := mcpserver.NewSSEServer(s.mcp, mcpserver.WithBaseURL(s.mcpBaseURL))
-	streamHandler := mcpserver.NewStreamableHTTPServer(s.mcp)
+	getServer := func(*http.Request) *gomcp.Server { return s.mcp }
+	streamHandler := gomcp.NewStreamableHTTPHandler(getServer, &gomcp.StreamableHTTPOptions{
+		// Auth is handled by our middleware; localhost protection would
+		// reject requests arriving through a reverse proxy, so disable it.
+		DisableLocalhostProtection: true,
+	})
+	sseHandler := gomcp.NewSSEHandler(getServer, nil)
 
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		token := strings.TrimPrefix(r.Header.Get("Authorization"), "Bearer ")
@@ -231,15 +236,20 @@ func (s *Server) ListenAndServe(addr string) error {
 }
 
 // toolError returns a tool result that signals an error to the MCP client.
-func toolError(msg string) (*mcpgo.CallToolResult, error) {
-	return mcpgo.NewToolResultError(msg), nil
+func toolError(msg string) (*gomcp.CallToolResult, any, error) {
+	return &gomcp.CallToolResult{
+		IsError: true,
+		Content: []gomcp.Content{&gomcp.TextContent{Text: msg}},
+	}, nil, nil
 }
 
 // toolJSON marshals v and returns it as a text tool result.
-func toolJSON(v any) (*mcpgo.CallToolResult, error) {
+func toolJSON(v any) (*gomcp.CallToolResult, any, error) {
 	b, err := json.Marshal(v)
 	if err != nil {
 		return toolError("internal error: " + err.Error())
 	}
-	return mcpgo.NewToolResultText(string(b)), nil
+	return &gomcp.CallToolResult{
+		Content: []gomcp.Content{&gomcp.TextContent{Text: string(b)}},
+	}, nil, nil
 }
