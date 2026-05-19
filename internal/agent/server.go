@@ -210,7 +210,7 @@ func (s *Server) handleDownload(w http.ResponseWriter, r *http.Request) {
 	var filename string
 	switch {
 	case strings.HasPrefix(path, "loader-"):
-		filename = path // e.g. "loader-linux-amd64"
+		filename = filepath.Base(path) // e.g. "loader-linux-amd64"
 
 	case strings.HasPrefix(path, "second-stage/"):
 		tokenStr := strings.TrimPrefix(r.Header.Get("Authorization"), "Bearer ")
@@ -232,7 +232,7 @@ func (s *Server) handleDownload(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		osArch := strings.TrimPrefix(path, "second-stage/")
-		filename = "agent-" + osArch
+		filename = "agent-" + filepath.Base(osArch)
 
 	default:
 		http.NotFound(w, r)

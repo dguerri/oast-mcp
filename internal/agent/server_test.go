@@ -580,16 +580,15 @@ func TestDownloadSecondStage_ValidToken_BinaryMissing(t *testing.T) {
 func TestDownloadSecondStage_ValidToken_BinaryPresent(t *testing.T) {
 	_, a, dir, ts := newHTTPTestServer(t)
 
-	// The server maps /dl/second-stage/linux/amd64 to binDir/agent-linux/amd64.
-	// That path contains a slash (subdirectory), so create the directory first.
-	agentBinPath := filepath.Join(dir, "agent-linux", "amd64")
+	// The server maps /dl/second-stage/linux-amd64 to binDir/agent-linux-amd64.
+	agentBinPath := filepath.Join(dir, "agent-linux-amd64")
 	require.NoError(t, os.MkdirAll(filepath.Dir(agentBinPath), 0o755))
 	require.NoError(t, os.WriteFile(agentBinPath, []byte("fake-agent"), 0o644))
 
 	token, err := a.IssueAgent("alice", "agent-dl-ok", []string{"agent:connect"}, time.Hour)
 	require.NoError(t, err)
 
-	req, err := http.NewRequest(http.MethodGet, ts.URL+"/dl/second-stage/linux/amd64", nil)
+	req, err := http.NewRequest(http.MethodGet, ts.URL+"/dl/second-stage/linux-amd64", nil)
 	require.NoError(t, err)
 	req.Header.Set("Authorization", "Bearer "+token)
 
